@@ -1,0 +1,6 @@
+build/
+nob
+*.o
+*.a
+*.so
+.DS_Store
