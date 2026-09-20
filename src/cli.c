@@ -26,6 +26,7 @@ void cli_print_help(const char *prog_name)
     printf("  -d, --debug                           Enable debug output\n");
     printf("  -q, --quiet                           Suppress non-essential messages\n");
     printf("  -i, --interactive                     Always prompt with TUI selector\n");
+    printf("  -y, --yes                             Skip confirmation for destructive commands\n");
     printf("\n");
     printf("Database & Maintenance Commands:\n");
     printf("  %s add <path>                         Add or update directory in database\n", prog_name);
@@ -36,7 +37,9 @@ void cli_print_help(const char *prog_name)
     printf("  %s doctor                             Check environment, database, and search roots\n", prog_name);
     printf("\n");
     printf("Configuration Commands:\n");
-    printf("  %s config                             Display current configuration\n", prog_name);
+    printf("  %s config                             Open interactive config TUI (edits TOML)\n", prog_name);
+    printf("  %s config show                        Print configuration as TOML\n", prog_name);
+    printf("  %s config edit                        Open interactive config TUI\n", prog_name);
     printf("  %s root list                          List configured search roots\n", prog_name);
     printf("  %s root add <path>                    Add a filesystem search root\n", prog_name);
     printf("  %s root remove <path>                 Remove a filesystem search root\n", prog_name);
@@ -84,6 +87,9 @@ bool cli_parse(int argc, char **argv, Cli_Args *args)
             i++;
         } else if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--interactive") == 0) {
             args->interactive = true;
+            i++;
+        } else if (strcmp(argv[i], "-y") == 0 || strcmp(argv[i], "--yes") == 0) {
+            args->yes = true;
             i++;
         } else if (strcmp(argv[i], "--cd") == 0) {
             args->action = CLI_ACTION_CD;
@@ -160,7 +166,15 @@ bool cli_parse(int argc, char **argv, Cli_Args *args)
         args->action = CLI_ACTION_DOCTOR;
         return true;
     } else if (strcmp(first, "config") == 0) {
-        args->action = CLI_ACTION_CONFIG_SHOW;
+        i++;
+        if (i >= argc || strcmp(argv[i], "edit") == 0 || strcmp(argv[i], "tui") == 0) {
+            args->action = CLI_ACTION_CONFIG_EDIT;
+        } else if (strcmp(argv[i], "show") == 0 || strcmp(argv[i], "print") == 0) {
+            args->action = CLI_ACTION_CONFIG_SHOW;
+        } else {
+            jrun_log_error("unknown config subcommand '%s' (use show or edit)", argv[i]);
+            return false;
+        }
         return true;
     } else if (strcmp(first, "shell") == 0) {
         args->action = CLI_ACTION_INIT_SHELL;

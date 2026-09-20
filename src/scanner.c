@@ -5,6 +5,7 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <limits.h>
+#include <pthread.h>
 
 typedef struct {
     dev_t dev;
@@ -28,6 +29,14 @@ typedef struct {
     int max_depth;
     bool follow_symlinks;
 } Scanner_Context;
+
+typedef struct {
+    Scanner_Context ctx;
+    char root_path[PATH_MAX];
+    int max_depth;
+    bool follow_symlinks;
+    bool success;
+} Scan_Thread_Arg;
 
 static const char *IGNORED_DIR_NAMES[] = {
     ".git",
@@ -76,7 +85,7 @@ static bool scanner_add_path(Scanner_Context *ctx, const char *path)
         ctx->capacity = new_cap;
     }
 
-    char *copy = strdup(path);
+    char *copy = jrun_strdup(path);
     if (!copy) return false;
     ctx->paths[ctx->count++] = copy;
     return true;
@@ -171,6 +180,18 @@ static void scanner_recurse(Scanner_Context *ctx, const char *dir_path, int dept
         int n = snprintf(child_path, sizeof(child_path), "%s/%s", dir_path, entry->d_name);
         if (n <= 0 || (size_t)n >= sizeof(child_path)) continue;
 
+#ifdef _DIRENT_HAVE_D_TYPE
+        if (!ctx->follow_symlinks && entry->d_type != DT_UNKNOWN &&
+            entry->d_type != DT_DIR && entry->d_type != DT_LNK) {
+            continue;
+        }
+        if (entry->d_type == DT_DIR) {
+            scanner_add_path(ctx, child_path);
+            scanner_recurse(ctx, child_path, depth + 1);
+            continue;
+        }
+#endif
+
         struct stat child_st;
         int stat_res = ctx->follow_symlinks ? stat(child_path, &child_st) : lstat(child_path, &child_st);
         if (stat_res != 0) continue;
@@ -184,43 +205,6 @@ static void scanner_recurse(Scanner_Context *ctx, const char *dir_path, int dept
     closedir(dir);
 }
 
-bool scanner_scan_roots(const Jrun_Config *config, char ***out_paths, size_t *out_count)
-{
-    if (!config || !out_paths || !out_count) return false;
-
-    Scanner_Context ctx = {0};
-    ctx.max_depth = config->max_depth > 0 ? config->max_depth : DEFAULT_MAX_DEPTH;
-    ctx.follow_symlinks = config->follow_symlinks;
-
-    for (size_t i = 0; i < config->roots_count; ++i) {
-        char expanded[PATH_MAX];
-        if (!path_expand_tilde(config->roots[i], expanded, sizeof(expanded))) {
-            continue;
-        }
-
-        char normalized[PATH_MAX];
-        if (!path_normalize(expanded, normalized, sizeof(normalized))) {
-            continue;
-        }
-
-        if (!path_is_dir(normalized)) {
-            jrun_log_debug("search root does not exist or is not a directory: %s", normalized);
-            continue;
-        }
-
-        // Add the root directory itself as a candidate
-        scanner_add_path(&ctx, normalized);
-        // Recurse into subdirectories
-        scanner_recurse(&ctx, normalized, 1);
-    }
-
-    free(ctx.visited.slots);
-
-    *out_paths = ctx.paths;
-    *out_count = ctx.count;
-    return true;
-}
-
 void scanner_free_paths(char **paths, size_t count)
 {
     if (!paths) return;
@@ -228,4 +212,144 @@ void scanner_free_paths(char **paths, size_t count)
         free(paths[i]);
     }
     free(paths);
+}
+
+static void *scan_root_thread(void *arg)
+{
+    Scan_Thread_Arg *targ = (Scan_Thread_Arg *)arg;
+    Scanner_Context *ctx = &targ->ctx;
+
+    scanner_add_path(ctx, targ->root_path);
+    scanner_recurse(ctx, targ->root_path, 1);
+    targ->success = true;
+    return NULL;
+}
+
+static bool scanner_merge_results(char ***out_paths, size_t *out_count,
+                                  Scanner_Context *results, size_t root_count)
+{
+    size_t total = 0;
+    for (size_t i = 0; i < root_count; i++) {
+        total += results[i].count;
+    }
+
+    if (total == 0) {
+        *out_paths = NULL;
+        *out_count = 0;
+        return true;
+    }
+
+    char **merged = (char **)malloc(total * sizeof(char *));
+    if (!merged) return false;
+
+    size_t idx = 0;
+    for (size_t i = 0; i < root_count; i++) {
+        for (size_t j = 0; j < results[i].count; j++) {
+            merged[idx++] = results[i].paths[j];
+            results[i].paths[j] = NULL;
+        }
+    }
+
+    *out_paths = merged;
+    *out_count = idx;
+    return true;
+}
+
+bool scanner_scan_roots(const Jrun_Config *config, char ***out_paths, size_t *out_count)
+{
+    if (!config || !out_paths || !out_count) return false;
+
+    size_t valid_roots = 0;
+    for (size_t i = 0; i < config->roots_count; ++i) {
+        char expanded[PATH_MAX];
+        if (!path_expand_tilde(config->roots[i], expanded, sizeof(expanded))) continue;
+        char normalized[PATH_MAX];
+        if (!path_normalize(expanded, normalized, sizeof(normalized))) continue;
+        if (!path_is_dir(normalized)) {
+            jrun_log_debug("search root does not exist or is not a directory: %s", normalized);
+            continue;
+        }
+        valid_roots++;
+    }
+
+    if (valid_roots == 0) {
+        *out_paths = NULL;
+        *out_count = 0;
+        return true;
+    }
+
+    int max_depth = config->max_depth > 0 ? config->max_depth : DEFAULT_MAX_DEPTH;
+    bool follow_symlinks = config->follow_symlinks;
+
+    if (valid_roots == 1) {
+        Scanner_Context ctx = {0};
+        ctx.max_depth = max_depth;
+        ctx.follow_symlinks = follow_symlinks;
+
+        for (size_t i = 0; i < config->roots_count; ++i) {
+            char expanded[PATH_MAX];
+            if (!path_expand_tilde(config->roots[i], expanded, sizeof(expanded))) continue;
+            char normalized[PATH_MAX];
+            if (!path_normalize(expanded, normalized, sizeof(normalized))) continue;
+            if (!path_is_dir(normalized)) continue;
+
+            scanner_add_path(&ctx, normalized);
+            scanner_recurse(&ctx, normalized, 1);
+            break;
+        }
+
+        free(ctx.visited.slots);
+        *out_paths = ctx.paths;
+        *out_count = ctx.count;
+        return true;
+    }
+
+    pthread_t *threads = (pthread_t *)malloc(valid_roots * sizeof(pthread_t));
+    Scan_Thread_Arg *args = (Scan_Thread_Arg *)malloc(valid_roots * sizeof(Scan_Thread_Arg));
+    Scanner_Context *results = (Scanner_Context *)calloc(valid_roots, sizeof(Scanner_Context));
+
+    if (!threads || !args || !results) {
+        free(threads);
+        free(args);
+        free(results);
+        return false;
+    }
+
+    size_t thread_idx = 0;
+    for (size_t i = 0; i < config->roots_count; ++i) {
+        char expanded[PATH_MAX];
+        if (!path_expand_tilde(config->roots[i], expanded, sizeof(expanded))) continue;
+        char normalized[PATH_MAX];
+        if (!path_normalize(expanded, normalized, sizeof(normalized))) continue;
+        if (!path_is_dir(normalized)) continue;
+
+        results[thread_idx].max_depth = max_depth;
+        results[thread_idx].follow_symlinks = follow_symlinks;
+
+        args[thread_idx].ctx = results[thread_idx];
+        strncpy(args[thread_idx].root_path, normalized, PATH_MAX - 1);
+        args[thread_idx].root_path[PATH_MAX - 1] = '\0';
+        args[thread_idx].max_depth = max_depth;
+        args[thread_idx].follow_symlinks = follow_symlinks;
+        args[thread_idx].success = false;
+
+        pthread_create(&threads[thread_idx], NULL, scan_root_thread, &args[thread_idx]);
+        thread_idx++;
+    }
+
+    for (size_t i = 0; i < valid_roots; i++) {
+        pthread_join(threads[i], NULL);
+        results[i] = args[i].ctx;
+    }
+
+    bool ok = scanner_merge_results(out_paths, out_count, results, valid_roots);
+
+    for (size_t i = 0; i < valid_roots; i++) {
+        free(results[i].visited.slots);
+    }
+    free(threads);
+    free(args);
+    free(results);
+
+    return ok;
 }

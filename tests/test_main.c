@@ -128,6 +128,12 @@ static bool test_matcher(void)
     Match_Result m6 = matcher_evaluate("completelyunrelated", "/home/user/development/constituent");
     ASSERT(!m6.is_match, "unrelated should not match");
 
+    Match_Result m_ac = matcher_evaluate("pcs", "/home/user/PMS.CatalogService");
+    ASSERT(m_ac.is_match, "acronym pcs -> PMS.CatalogService");
+
+    Match_Result m_multi = matcher_evaluate("dev/jrun", "/home/user/development/jrun");
+    ASSERT(m_multi.is_match, "multi-component prefix match");
+
     return true;
 }
 
@@ -164,6 +170,27 @@ static bool test_config(void)
     ASSERT(config_load(&loaded, tmp_cfg_path), "load config");
     ASSERT(loaded.roots_count == cfg.roots_count, "roots count match");
     ASSERT(loaded.max_depth == cfg.max_depth, "max depth match");
+    ASSERT(loaded.confirm_destructive == cfg.confirm_destructive, "confirm flag match");
+    ASSERT(loaded.confirm_commands_count == cfg.confirm_commands_count, "confirm commands match");
+    ASSERT(config_needs_confirm(&loaded, "rm"), "rm requires confirm");
+    ASSERT(config_needs_confirm(&loaded, "/bin/mv"), "mv path requires confirm");
+    ASSERT(!config_needs_confirm(&loaded, "nvim"), "nvim does not require confirm");
+
+    Jrun_Config safety = {0};
+    const char *tmp_safety = "/tmp/jrun_test_safety.toml";
+    FILE *sf = fopen(tmp_safety, "w");
+    ASSERT(sf != NULL, "write safety config");
+    fputs("[safety]\nconfirm = true\ncommands = [\"rm\", \"mv\"]\n", sf);
+    fclose(sf);
+    ASSERT(config_load(&safety, tmp_safety), "load safety config");
+    ASSERT(safety.confirm_destructive == true, "confirm enabled");
+    ASSERT(safety.confirm_commands_count == 2, "two confirm commands");
+    ASSERT(config_needs_confirm(&safety, "rm"), "rm listed");
+    ASSERT(!config_needs_confirm(&safety, "chmod"), "chmod not listed");
+    ASSERT(config_remove_confirm_command(&safety, "rm"), "remove confirm command");
+    ASSERT(!config_needs_confirm(&safety, "rm"), "rm removed from confirm list");
+    config_free(&safety);
+    unlink(tmp_safety);
 
     config_free(&cfg);
     config_free(&loaded);
@@ -290,6 +317,42 @@ static bool test_duplicate_disambiguation(void)
     return true;
 }
 
+static bool test_bare_name_not_cwd_relative(void)
+{
+    system("rm -rf /tmp/jrun_cwd_test && mkdir -p /tmp/jrun_cwd_test/home/thirdparty /tmp/jrun_cwd_test/dev/jrun/thirdparty");
+
+    Jrun_Config cfg = {0};
+    config_init_default(&cfg);
+    for (size_t i = 0; i < cfg.roots_count; ++i) free(cfg.roots[i]);
+    cfg.roots_count = 0;
+    config_add_root(&cfg, "/tmp/jrun_cwd_test/home");
+    config_add_root(&cfg, "/tmp/jrun_cwd_test/dev");
+
+    char old_cwd[PATH_MAX];
+    ASSERT(getcwd(old_cwd, sizeof(old_cwd)) != NULL, "save cwd");
+    ASSERT(chdir("/tmp/jrun_cwd_test/dev/jrun") == 0, "chdir into nested project");
+
+    Resolve_Result res = resolver_resolve("thirdparty", &cfg, false);
+    ASSERT(res.count == 2, "both home and nested thirdparty directories are candidates");
+    ASSERT(res.status == RESOLVE_AMBIGUOUS, "same basename must stay ambiguous even from nested cwd");
+
+    bool found_home = false;
+    bool found_nested = false;
+    for (size_t i = 0; i < res.count; ++i) {
+        if (strstr(res.candidates[i].path, "/home/thirdparty")) found_home = true;
+        if (strstr(res.candidates[i].path, "/dev/jrun/thirdparty")) found_nested = true;
+    }
+    ASSERT(found_home, "found ~/thirdparty equivalent");
+    ASSERT(found_nested, "found nested jrun/thirdparty");
+
+    resolver_free_result(&res);
+    ASSERT(chdir(old_cwd) == 0, "restore cwd");
+    config_free(&cfg);
+    system("rm -rf /tmp/jrun_cwd_test");
+
+    return true;
+}
+
 // 7. CLI argument parsing tests
 static bool test_cli_parsing(void)
 {
@@ -361,6 +424,32 @@ static bool test_cli_parsing(void)
         cli_free_args(&args);
     }
 
+    {
+        char *argv[] = {"jrun", "-y", "hypr", "rm", "-rf", "build", NULL};
+        Cli_Args args = {0};
+        ASSERT(cli_parse(6, argv, &args), "parse -y");
+        ASSERT(args.yes == true, "yes set");
+        ASSERT(args.action == CLI_ACTION_EXECUTE, "execute action");
+        ASSERT(strcmp(args.cmd_argv[0], "rm") == 0, "cmd is rm");
+        cli_free_args(&args);
+    }
+
+    {
+        char *argv[] = {"jrun", "config", NULL};
+        Cli_Args args = {0};
+        ASSERT(cli_parse(2, argv, &args), "parse jrun config");
+        ASSERT(args.action == CLI_ACTION_CONFIG_EDIT, "config opens TUI");
+        cli_free_args(&args);
+    }
+
+    {
+        char *argv[] = {"jrun", "config", "show", NULL};
+        Cli_Args args = {0};
+        ASSERT(cli_parse(3, argv, &args), "parse jrun config show");
+        ASSERT(args.action == CLI_ACTION_CONFIG_SHOW, "config show prints TOML");
+        cli_free_args(&args);
+    }
+
     // Test 7: jrun tatr cd (explicit cd command suffix -> CD action)
     {
         char *argv[] = {"jrun", "tatr", "cd", NULL};
@@ -421,6 +510,7 @@ int main(void)
     RUN_TEST(test_database);
     RUN_TEST(test_scanner);
     RUN_TEST(test_duplicate_disambiguation);
+    RUN_TEST(test_bare_name_not_cwd_relative);
     RUN_TEST(test_cli_parsing);
     RUN_TEST(test_shell_integration);
     RUN_TEST(test_executor);

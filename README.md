@@ -112,7 +112,9 @@ Running `jrun constituent nvim` will automatically launch the interactive TUI:
 ```
 
 - **Arrow Keys (Up / Down)**: Navigate candidates
+- **Ctrl-N / Ctrl-P**: Same as down / up
 - **Typing**: Live fuzzy filters the candidate list in real time
+- **Ctrl-U / Ctrl-W**: Clear the query, or delete the last word
 - **Enter**: Confirm selection and launch command
 - **Esc / Ctrl-C**: Cancel
 
@@ -182,6 +184,7 @@ Options:
   -d, --debug                           Enable debug logging
   -q, --quiet                           Suppress non-essential messages
   -i, --interactive                     Always prompt with TUI selector
+  -y, --yes                             Skip confirmation for destructive commands
 
 Database & Maintenance Commands:
   jrun add <path>                       Add or update directory in database
@@ -192,7 +195,9 @@ Database & Maintenance Commands:
   jrun doctor                           Run environment, database, and root diagnostics
 
 Configuration Commands:
-  jrun config                           Display current configuration
+  jrun config                           Open interactive config TUI (reads/writes TOML)
+  jrun config show                      Print configuration as TOML
+  jrun config edit                      Same as `jrun config`
   jrun root list                        List configured search roots
   jrun root add <path>                  Add a filesystem search root
   jrun root remove <path>               Remove a filesystem search root
@@ -222,16 +227,41 @@ follow_symlinks = false
 fuzzy = true
 interactive = true
 frecency_threshold = 2.00
+
+[safety]
+# Prompt before running these commands in a resolved directory.
+# Disable with confirm = false, or skip once with -y / --yes.
+confirm = true
+commands = [
+    "rm",
+    "rmdir",
+    "mv",
+    "unlink",
+    "shred",
+    "dd",
+    "chmod",
+    "chown"
+]
 ```
 
-You can inspect and modify roots directly with CLI commands:
+You can edit the same file in a TUI (it loads and saves this TOML, it does not replace it):
+
+```bash
+jrun config          # interactive editor
+jrun config show     # print TOML to stdout
+```
+
+Keys: ↑↓ move, Enter/Space toggle or edit, `a` add root/command, `d` delete, `+/-` adjust numbers, Ctrl-S save, `q` quit.
+
+Or change roots from the CLI:
 
 ```bash
 jrun root list
 jrun root add ~/work
 jrun root remove ~/Documents
-jrun config
 ```
+
+Destructive commands listed under `[safety]` (for example `rm` and `mv`) show a confirmation prompt before they run. Use `-y` / `--yes` to skip a prompt, or set `confirm = false` to disable them.
 
 ---
 

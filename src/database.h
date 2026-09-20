@@ -19,6 +19,7 @@ void db_close(void);
 bool db_add_or_update(const char *path);
 bool db_remove(const char *path);
 bool db_get_all(Db_Entry **entries, size_t *count);
+bool db_get_top_k(Db_Entry **entries, size_t *count, size_t k);
 void db_free_entries(Db_Entry *entries, size_t count);
 bool db_prune(size_t *pruned_count);
 bool db_age_if_needed(void);

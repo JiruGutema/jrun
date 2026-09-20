@@ -118,6 +118,22 @@ int main(int argc, char **argv)
         return 0;
     }
 
+    if (args.action == CLI_ACTION_CONFIG_EDIT) {
+        int cfg_rc = 0;
+        if (isatty(STDIN_FILENO) && isatty(STDOUT_FILENO)) {
+            if (!tui_edit_config(&config, config_path)) {
+                cfg_rc = 1;
+            }
+        } else {
+            printf("Configuration file: %s\n\n", config_path);
+            config_print(&config);
+            printf("\n(open a terminal to use `jrun config edit`)\n");
+        }
+        config_free(&config);
+        cli_free_args(&args);
+        return cfg_rc;
+    }
+
     if (args.action == CLI_ACTION_ROOT_LIST) {
         printf("Configured search roots (%zu):\n", config.roots_count);
         for (size_t i = 0; i < config.roots_count; ++i) {
@@ -338,7 +354,15 @@ int main(int argc, char **argv)
                     fflush(stderr);
                 }
             }
-            // Execute command in resolved directory
+            if (!args.yes && config_needs_confirm(&config, args.cmd_argv[0])) {
+                if (!tui_confirm_command(selected_path, args.cmd_argv)) {
+                    jrun_log_info("cancelled");
+                    free(selected_path);
+                    resolver_free_result(&res);
+                    ret_code = 130;
+                    break;
+                }
+            }
             ret_code = executor_run(selected_path, args.cmd_argv);
         }
 

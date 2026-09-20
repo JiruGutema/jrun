@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <math.h>
 #include <limits.h>
 
 static sqlite3 *g_db = NULL;
@@ -17,20 +18,13 @@ double db_calculate_frecency(double frequency, int64_t last_access, int64_t curr
     int64_t delta = current_time - last_access;
     if (delta < 0) delta = 0;
 
-    double recency_weight;
-    if (delta < 3600) {            
-        recency_weight = 4.0;
-    } else if (delta < 86400) {    
-        recency_weight = 2.0;
-    } else if (delta < 604800) {   
-        recency_weight = 1.0;
-    } else if (delta < 2592000) {  
-        recency_weight = 0.5;
-    } else {                       
-        recency_weight = 0.25;
+    // Half-life of 14 days, with a short-term boost for the last hour.
+    double days = (double)delta / 86400.0;
+    double recency = pow(0.5, days / 14.0);
+    if (delta < 3600) {
+        recency *= 1.25;
     }
-
-    return frequency * recency_weight;
+    return frequency * recency;
 }
 
 bool db_init(const char *db_path)
@@ -168,6 +162,49 @@ static int compare_entries_desc(const void *a, const void *b)
     return 0;
 }
 
+static bool db_load_entries(sqlite3_stmt *stmt, Db_Entry **entries, size_t *count)
+{
+    size_t capacity = 16;
+    Db_Entry *list = (Db_Entry *)malloc(capacity * sizeof(Db_Entry));
+    if (!list) return false;
+
+    int64_t now = (int64_t)time(NULL);
+    size_t n = 0;
+
+    int rc;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (n >= capacity) {
+            capacity *= 2;
+            Db_Entry *new_list = (Db_Entry *)realloc(list, capacity * sizeof(Db_Entry));
+            if (!new_list) {
+                db_free_entries(list, n);
+                return false;
+            }
+            list = new_list;
+        }
+
+        int64_t id = sqlite3_column_int64(stmt, 0);
+        const char *p = (const char *)sqlite3_column_text(stmt, 1);
+        double freq = sqlite3_column_double(stmt, 2);
+        int64_t last_acc = sqlite3_column_int64(stmt, 3);
+
+        list[n].id = id;
+        list[n].path = jrun_strdup(p ? p : "");
+        list[n].frequency = freq;
+        list[n].last_access = last_acc;
+        list[n].frecency = db_calculate_frecency(freq, last_acc, now);
+        n++;
+    }
+
+    if (n > 1) {
+        qsort(list, n, sizeof(Db_Entry), compare_entries_desc);
+    }
+
+    *entries = list;
+    *count = n;
+    return true;
+}
+
 bool db_get_all(Db_Entry **entries, size_t *count)
 {
     if (!g_db || !entries || !count) return false;
@@ -183,50 +220,33 @@ bool db_get_all(Db_Entry **entries, size_t *count)
         return false;
     }
 
-    size_t capacity = 16;
-    Db_Entry *list = (Db_Entry *)malloc(capacity * sizeof(Db_Entry));
-    if (!list) {
-        sqlite3_finalize(stmt);
+    bool ok = db_load_entries(stmt, entries, count);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+bool db_get_top_k(Db_Entry **entries, size_t *count, size_t k)
+{
+    if (!g_db || !entries || !count || k == 0) return false;
+
+    *entries = NULL;
+    *count = 0;
+
+    char sql[128];
+    snprintf(sql, sizeof(sql),
+        "SELECT id, path, frequency, last_access FROM directories "
+        "ORDER BY frequency DESC, last_access DESC LIMIT %zu;", k);
+
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        jrun_log_error("sqlite prepare failed: %s", sqlite3_errmsg(g_db));
         return false;
     }
 
-    int64_t now = (int64_t)time(NULL);
-    size_t n = 0;
-
-    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
-        if (n >= capacity) {
-            capacity *= 2;
-            Db_Entry *new_list = (Db_Entry *)realloc(list, capacity * sizeof(Db_Entry));
-            if (!new_list) {
-                db_free_entries(list, n);
-                sqlite3_finalize(stmt);
-                return false;
-            }
-            list = new_list;
-        }
-
-        int64_t id = sqlite3_column_int64(stmt, 0);
-        const char *p = (const char *)sqlite3_column_text(stmt, 1);
-        double freq = sqlite3_column_double(stmt, 2);
-        int64_t last_acc = sqlite3_column_int64(stmt, 3);
-
-        list[n].id = id;
-        list[n].path = strdup(p ? p : "");
-        list[n].frequency = freq;
-        list[n].last_access = last_acc;
-        list[n].frecency = db_calculate_frecency(freq, last_acc, now);
-        n++;
-    }
-
+    bool ok = db_load_entries(stmt, entries, count);
     sqlite3_finalize(stmt);
-
-    if (n > 1) {
-        qsort(list, n, sizeof(Db_Entry), compare_entries_desc);
-    }
-
-    *entries = list;
-    *count = n;
-    return true;
+    return ok;
 }
 
 void db_free_entries(Db_Entry *entries, size_t count)
@@ -306,14 +326,23 @@ bool db_age_if_needed(void)
     }
     sqlite3_finalize(stmt);
 
-    // If total frequency exceeds 10,000, scale down all frequencies by 0.90
-    if (total_freq > 10000.0) {
-        const char *age_sql = "UPDATE directories SET frequency = frequency * 0.90;";
-        sqlite3_exec(g_db, age_sql, NULL, NULL, NULL);
-        // Also delete entries that drop below 0.1
-        const char *cleanup_sql = "DELETE FROM directories WHERE frequency < 0.1;";
-        sqlite3_exec(g_db, cleanup_sql, NULL, NULL, NULL);
+    if (total_freq <= 10000.0) return true;
+
+    int64_t now = (int64_t)time(NULL);
+    int64_t age_threshold = now - 604800;
+
+    const char *age_sql =
+        "UPDATE directories SET frequency = frequency * 0.90 "
+        "WHERE last_access < ?1;";
+    sqlite3_stmt *age_stmt = NULL;
+    if (sqlite3_prepare_v2(g_db, age_sql, -1, &age_stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(age_stmt, 1, age_threshold);
+        sqlite3_step(age_stmt);
+        sqlite3_finalize(age_stmt);
     }
+
+    const char *cleanup_sql = "DELETE FROM directories WHERE frequency < 0.1;";
+    sqlite3_exec(g_db, cleanup_sql, NULL, NULL, NULL);
 
     return true;
 }

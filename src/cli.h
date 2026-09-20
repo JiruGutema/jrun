@@ -14,6 +14,7 @@ typedef enum {
     CLI_ACTION_PRUNE,
     CLI_ACTION_DOCTOR,
     CLI_ACTION_CONFIG_SHOW,
+    CLI_ACTION_CONFIG_EDIT,
     CLI_ACTION_ROOT_ADD,
     CLI_ACTION_ROOT_REMOVE,
     CLI_ACTION_ROOT_LIST,
@@ -31,6 +32,7 @@ typedef struct {
     bool interactive;
     bool debug;
     bool quiet;
+    bool yes;
 } Cli_Args;
 
 bool cli_parse(int argc, char **argv, Cli_Args *args);
