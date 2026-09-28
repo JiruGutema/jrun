@@ -1,5 +1,6 @@
 #include "cli.h"
 #include "common.h"
+#include "path_util.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,8 +13,15 @@ void cli_print_version(void)
     printf("%s %s\n", JRUN_PROGRAM_NAME, JRUN_VERSION);
 }
 
-void cli_print_help(const char *prog_name)
+void cli_print_help(const char *invoked_as)
 {
+    // argv[0] can be an absolute path; showing it verbatim makes every line of
+    // the help text unreadable.
+    char prog_buf[64];
+    const char *prog_name = path_basename_r(invoked_as ? invoked_as : JRUN_PROGRAM_NAME,
+                                            prog_buf, sizeof(prog_buf));
+    if (prog_name[0] == '\0') prog_name = JRUN_PROGRAM_NAME;
+
     printf("Usage:\n");
     printf("  %s <target> <command> [args...]       Execute command in resolved directory\n", prog_name);
     printf("  %s <target> -- <command> [args...]    Unambiguous target and command syntax\n", prog_name);
@@ -34,6 +42,7 @@ void cli_print_help(const char *prog_name)
     printf("  %s list                               List tracked directories with frecency\n", prog_name);
     printf("  %s query <target>                     Query matches and display ranking scores\n", prog_name);
     printf("  %s prune                              Remove non-existent directories from database\n", prog_name);
+    printf("  %s reindex                            Rebuild the cached directory index now\n", prog_name);
     printf("  %s doctor                             Check environment, database, and search roots\n", prog_name);
     printf("\n");
     printf("Configuration Commands:\n");
@@ -161,6 +170,9 @@ bool cli_parse(int argc, char **argv, Cli_Args *args)
         return true;
     } else if (strcmp(first, "prune") == 0) {
         args->action = CLI_ACTION_PRUNE;
+        return true;
+    } else if (strcmp(first, "reindex") == 0) {
+        args->action = CLI_ACTION_REINDEX;
         return true;
     } else if (strcmp(first, "doctor") == 0) {
         args->action = CLI_ACTION_DOCTOR;

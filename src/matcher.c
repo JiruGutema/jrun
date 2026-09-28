@@ -179,29 +179,39 @@ static bool component_matches(const char *part, const char *comp, double *qualit
     return false;
 }
 
+#define MATCH_MAX_TARGET_PARTS 32
+#define MATCH_MAX_PATH_PARTS 128
+
 static bool match_multicomponent(const char *target, const char *path, double *quality_out)
 {
-    char target_copy[256];
-    strncpy(target_copy, target, sizeof(target_copy) - 1);
-    target_copy[sizeof(target_copy) - 1] = '\0';
+    // Refuse rather than truncate. Silently cutting the target at 256 bytes
+    // turned "a/very/long/path/..." into a different query and reported a
+    // confident match against it.
+    char target_copy[512];
+    if (strlen(target) >= sizeof(target_copy)) return false;
+    memcpy(target_copy, target, strlen(target) + 1);
 
     char path_copy[PATH_MAX];
-    strncpy(path_copy, path, sizeof(path_copy) - 1);
-    path_copy[sizeof(path_copy) - 1] = '\0';
+    if (strlen(path) >= sizeof(path_copy)) return false;
+    memcpy(path_copy, path, strlen(path) + 1);
 
-    const char *tparts[32];
+    const char *tparts[MATCH_MAX_TARGET_PARTS];
     size_t nt = 0;
     char *save = NULL;
-    for (char *tok = strtok_r(target_copy, "/", &save); tok && nt < 32; tok = strtok_r(NULL, "/", &save)) {
-        if (tok[0] != '\0') tparts[nt++] = tok;
+    for (char *tok = strtok_r(target_copy, "/", &save); tok; tok = strtok_r(NULL, "/", &save)) {
+        if (tok[0] == '\0') continue;
+        if (nt >= MATCH_MAX_TARGET_PARTS) return false;
+        tparts[nt++] = tok;
     }
     if (nt == 0) return false;
 
-    const char *pparts[128];
+    const char *pparts[MATCH_MAX_PATH_PARTS];
     size_t np = 0;
     save = NULL;
-    for (char *tok = strtok_r(path_copy, "/", &save); tok && np < 128; tok = strtok_r(NULL, "/", &save)) {
-        if (tok[0] != '\0') pparts[np++] = tok;
+    for (char *tok = strtok_r(path_copy, "/", &save); tok; tok = strtok_r(NULL, "/", &save)) {
+        if (tok[0] == '\0') continue;
+        if (np >= MATCH_MAX_PATH_PARTS) return false;
+        pparts[np++] = tok;
     }
 
     size_t pi = 0;
@@ -238,7 +248,8 @@ Match_Result matcher_evaluate_opts(const char *target, const char *path, bool en
         return res;
     }
 
-    const char *bname = path_basename(path);
+    char bname_buf[PATH_MAX];
+    const char *bname = path_basename_r(path, bname_buf, sizeof(bname_buf));
     size_t target_len = strlen(target);
     size_t bname_len = strlen(bname);
 
@@ -326,4 +337,76 @@ Match_Result matcher_evaluate_opts(const char *target, const char *path, bool en
 Match_Result matcher_evaluate(const char *target, const char *path)
 {
     return matcher_evaluate_opts(target, path, true);
+}
+
+static size_t highlight_substring(const char *pattern, const char *text,
+                                  unsigned char *mask, size_t mask_len, size_t offset)
+{
+    const char *hit = strcasestr_custom(text + offset, pattern);
+    if (!hit) return 0;
+    size_t start = (size_t)(hit - text);
+    size_t plen = strlen(pattern);
+    size_t marked = 0;
+    for (size_t i = start; i < start + plen && i < mask_len; ++i) {
+        mask[i] = 1;
+        marked++;
+    }
+    return marked;
+}
+
+static size_t highlight_subsequence(const char *pattern, const char *text,
+                                    unsigned char *mask, size_t mask_len, size_t offset)
+{
+    size_t pi = 0;
+    size_t plen = strlen(pattern);
+    if (plen == 0) return 0;
+
+    // Two passes: first claim word-boundary characters so an acronym-style
+    // query lights up the initials rather than the first loose letters.
+    size_t marks[256];
+    size_t nmarks = 0;
+
+    for (size_t ti = offset; text[ti] && pi < plen && nmarks < 256; ++ti) {
+        if (!chars_eq_ci(pattern[pi], text[ti])) continue;
+        marks[nmarks++] = ti;
+        pi++;
+    }
+
+    if (pi != plen) return 0;
+
+    size_t marked = 0;
+    for (size_t i = 0; i < nmarks; ++i) {
+        if (marks[i] < mask_len) {
+            mask[marks[i]] = 1;
+            marked++;
+        }
+    }
+    return marked;
+}
+
+size_t matcher_highlight(const char *pattern, const char *text,
+                         unsigned char *mask, size_t mask_len)
+{
+    if (!mask || mask_len == 0) return 0;
+    memset(mask, 0, mask_len);
+    if (!pattern || !text || pattern[0] == '\0' || text[0] == '\0') return 0;
+
+    // The final component is where a match matters most, so try it first and
+    // only fall back to the whole path when the query spans directories.
+    size_t tlen = strlen(text);
+    size_t comp_start = 0;
+    for (size_t i = 0; i < tlen; ++i) {
+        if (text[i] == '/') comp_start = i + 1;
+    }
+
+    size_t marked = highlight_substring(pattern, text, mask, mask_len, comp_start);
+    if (marked) return marked;
+
+    marked = highlight_subsequence(pattern, text, mask, mask_len, comp_start);
+    if (marked) return marked;
+
+    marked = highlight_substring(pattern, text, mask, mask_len, 0);
+    if (marked) return marked;
+
+    return highlight_subsequence(pattern, text, mask, mask_len, 0);
 }

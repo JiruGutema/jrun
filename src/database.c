@@ -1,7 +1,7 @@
 #include "database.h"
 #include "common.h"
 #include "path_util.h"
-#include "sqlite3.h"
+#include <sqlite3.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -46,6 +46,14 @@ bool db_init(const char *db_path)
         return false;
     }
 
+    // The header may be the vendored copy while the library comes from the
+    // system, so make any skew visible instead of letting a missing symbol or a
+    // changed default surface as mysterious behaviour later.
+    if (sqlite3_libversion_number() < SQLITE_VERSION_NUMBER) {
+        jrun_log_debug("sqlite runtime %s is older than the headers (%s)",
+                       sqlite3_libversion(), SQLITE_VERSION);
+    }
+
     // Set busy timeout so concurrent shell hooks don't fail immediately with SQLITE_BUSY
     sqlite3_busy_timeout(g_db, 2000);
 
@@ -61,7 +69,16 @@ bool db_init(const char *db_path)
         "    last_access INTEGER NOT NULL"
         ");"
         "CREATE INDEX IF NOT EXISTS idx_path ON directories(path);"
-        "CREATE INDEX IF NOT EXISTS idx_last_access ON directories(last_access);";
+        "CREATE INDEX IF NOT EXISTS idx_last_access ON directories(last_access);"
+        // Cached filesystem index; see db_cache_* below. Created lazily on
+        // existing databases by the IF NOT EXISTS clauses.
+        "CREATE TABLE IF NOT EXISTS scan_cache ("
+        "    path TEXT PRIMARY KEY"
+        ") WITHOUT ROWID;"
+        "CREATE TABLE IF NOT EXISTS meta ("
+        "    key TEXT PRIMARY KEY,"
+        "    value TEXT NOT NULL"
+        ");";
 
     char *err_msg = NULL;
     rc = sqlite3_exec(g_db, schema, NULL, NULL, &err_msg);
@@ -344,5 +361,193 @@ bool db_age_if_needed(void)
     const char *cleanup_sql = "DELETE FROM directories WHERE frequency < 0.1;";
     sqlite3_exec(g_db, cleanup_sql, NULL, NULL, NULL);
 
+    return true;
+}
+
+// --- Cached filesystem index -------------------------------------------------
+
+static bool db_meta_get(const char *key, char *out, size_t out_size)
+{
+    if (!g_db || !key || !out || out_size == 0) return false;
+    out[0] = '\0';
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(g_db, "SELECT value FROM meta WHERE key = ?1;", -1, &stmt, NULL) != SQLITE_OK) {
+        return false;
+    }
+    sqlite3_bind_text(stmt, 1, key, -1, SQLITE_STATIC);
+
+    bool found = false;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *v = (const char *)sqlite3_column_text(stmt, 0);
+        if (v) {
+            snprintf(out, out_size, "%s", v);
+            found = true;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return found;
+}
+
+static bool db_meta_set(const char *key, const char *value)
+{
+    if (!g_db || !key || !value) return false;
+
+    sqlite3_stmt *stmt = NULL;
+    const char *sql = "INSERT INTO meta (key, value) VALUES (?1, ?2) "
+                      "ON CONFLICT(key) DO UPDATE SET value = ?2;";
+    if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK) return false;
+
+    sqlite3_bind_text(stmt, 1, key, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, value, -1, SQLITE_STATIC);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE;
+}
+
+bool db_cache_is_fresh(const char *fingerprint, int ttl_seconds)
+{
+    if (!g_db || !fingerprint || ttl_seconds <= 0) return false;
+
+    char stored_fp[64];
+    if (!db_meta_get("scan_fingerprint", stored_fp, sizeof(stored_fp))) return false;
+    if (strcmp(stored_fp, fingerprint) != 0) {
+        jrun_log_debug("scan cache: configuration changed, rescanning");
+        return false;
+    }
+
+    char stored_time[32];
+    if (!db_meta_get("scan_time", stored_time, sizeof(stored_time))) return false;
+
+    int64_t built = (int64_t)strtoll(stored_time, NULL, 10);
+    int64_t age = (int64_t)time(NULL) - built;
+    // A clock that moved backwards would otherwise pin the cache as fresh
+    // forever, so treat a negative age as stale.
+    if (age < 0 || age > (int64_t)ttl_seconds) {
+        jrun_log_debug("scan cache: %lld seconds old (ttl %d), rescanning",
+                       (long long)age, ttl_seconds);
+        return false;
+    }
+
+    jrun_log_debug("scan cache: fresh (%lld seconds old)", (long long)age);
+    return true;
+}
+
+bool db_cache_load(char ***paths, size_t *count)
+{
+    if (!g_db || !paths || !count) return false;
+    *paths = NULL;
+    *count = 0;
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(g_db, "SELECT path FROM scan_cache;", -1, &stmt, NULL) != SQLITE_OK) {
+        return false;
+    }
+
+    size_t capacity = 256;
+    char **list = (char **)malloc(capacity * sizeof(char *));
+    if (!list) {
+        sqlite3_finalize(stmt);
+        return false;
+    }
+
+    size_t n = 0;
+    bool ok = true;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        if (n >= capacity) {
+            size_t new_cap = capacity * 2;
+            char **grown = (char **)realloc(list, new_cap * sizeof(char *));
+            if (!grown) { ok = false; break; }
+            list = grown;
+            capacity = new_cap;
+        }
+        const char *p = (const char *)sqlite3_column_text(stmt, 0);
+        char *copy = jrun_strdup(p ? p : "");
+        if (!copy) { ok = false; break; }
+        list[n++] = copy;
+    }
+    sqlite3_finalize(stmt);
+
+    if (!ok) {
+        for (size_t i = 0; i < n; ++i) free(list[i]);
+        free(list);
+        return false;
+    }
+
+    *paths = list;
+    *count = n;
+    jrun_log_debug("scan cache: loaded %zu paths", n);
+    return true;
+}
+
+bool db_cache_store(char **paths, size_t count, const char *fingerprint)
+{
+    if (!g_db || !fingerprint) return false;
+    if (count > 0 && !paths) return false;
+
+    if (sqlite3_exec(g_db, "BEGIN IMMEDIATE;", NULL, NULL, NULL) != SQLITE_OK) {
+        // Another jrun is already rewriting the cache; its result is just as
+        // good as ours, so skip rather than block the user's lookup.
+        jrun_log_debug("scan cache: busy, skipping store");
+        return false;
+    }
+
+    bool ok = (sqlite3_exec(g_db, "DELETE FROM scan_cache;", NULL, NULL, NULL) == SQLITE_OK);
+
+    sqlite3_stmt *stmt = NULL;
+    if (ok && sqlite3_prepare_v2(g_db, "INSERT OR IGNORE INTO scan_cache (path) VALUES (?1);",
+                                 -1, &stmt, NULL) != SQLITE_OK) {
+        ok = false;
+    }
+
+    for (size_t i = 0; ok && i < count; ++i) {
+        sqlite3_reset(stmt);
+        sqlite3_bind_text(stmt, 1, paths[i], -1, SQLITE_STATIC);
+        if (sqlite3_step(stmt) != SQLITE_DONE) ok = false;
+    }
+    if (stmt) sqlite3_finalize(stmt);
+
+    if (ok) {
+        char now_buf[32];
+        snprintf(now_buf, sizeof(now_buf), "%lld", (long long)time(NULL));
+        ok = db_meta_set("scan_fingerprint", fingerprint) && db_meta_set("scan_time", now_buf);
+    }
+
+    if (ok) {
+        sqlite3_exec(g_db, "COMMIT;", NULL, NULL, NULL);
+        jrun_log_debug("scan cache: stored %zu paths", count);
+    } else {
+        sqlite3_exec(g_db, "ROLLBACK;", NULL, NULL, NULL);
+        jrun_log_debug("scan cache: store failed: %s", sqlite3_errmsg(g_db));
+    }
+    return ok;
+}
+
+bool db_cache_invalidate(void)
+{
+    if (!g_db) return false;
+    sqlite3_exec(g_db, "DELETE FROM scan_cache;", NULL, NULL, NULL);
+    return db_meta_set("scan_time", "0");
+}
+
+bool db_cache_stats(size_t *count, int64_t *built_at)
+{
+    if (!g_db) return false;
+
+    if (count) {
+        *count = 0;
+        sqlite3_stmt *stmt = NULL;
+        if (sqlite3_prepare_v2(g_db, "SELECT COUNT(*) FROM scan_cache;", -1, &stmt, NULL) == SQLITE_OK) {
+            if (sqlite3_step(stmt) == SQLITE_ROW) {
+                *count = (size_t)sqlite3_column_int64(stmt, 0);
+            }
+            sqlite3_finalize(stmt);
+        }
+    }
+
+    if (built_at) {
+        char buf[32];
+        *built_at = db_meta_get("scan_time", buf, sizeof(buf)) ? (int64_t)strtoll(buf, NULL, 10) : 0;
+    }
     return true;
 }

@@ -159,10 +159,11 @@ bool path_exists(const char *path)
     return (stat(path, &st) == 0);
 }
 
-const char *path_basename(const char *path)
+const char *path_basename_r(const char *path, char *out, size_t out_size)
 {
-    static _Thread_local char bname_buf[PATH_MAX];
-    if (!path || path[0] == '\0') return "";
+    if (!out || out_size == 0) return "";
+    out[0] = '\0';
+    if (!path || path[0] == '\0') return out;
 
     size_t len = strlen(path);
     while (len > 1 && path[len - 1] == '/') {
@@ -177,10 +178,78 @@ const char *path_basename(const char *path)
     }
 
     size_t bname_len = len - start;
-    if (bname_len >= sizeof(bname_buf)) bname_len = sizeof(bname_buf) - 1;
-    memcpy(bname_buf, path + start, bname_len);
-    bname_buf[bname_len] = '\0';
-    return bname_buf;
+    if (bname_len >= out_size) bname_len = out_size - 1;
+    memcpy(out, path + start, bname_len);
+    out[bname_len] = '\0';
+    return out;
+}
+
+// Ordered most- to least-specific: the first hit wins, so a Rust workspace
+// that also has a .git reports "rust" rather than the generic "git".
+static const struct { const char *file; const char *kind; } PROJECT_MARKERS[] = {
+    { "Cargo.toml",       "rust"   },
+    { "go.mod",           "go"     },
+    { "package.json",     "node"   },
+    { "pyproject.toml",   "python" },
+    { "setup.py",         "python" },
+    { "requirements.txt", "python" },
+    { "CMakeLists.txt",   "cmake"  },
+    { "Makefile",         "make"   },
+    { "nob.c",            "nob"    },
+    { "build.zig",        "zig"    },
+    { "pom.xml",          "java"   },
+    { "build.gradle",     "java"   },
+    { "Gemfile",          "ruby"   },
+    { "composer.json",    "php"    },
+    { ".git",             "git"    },
+    { ".hg",              "git"    },
+    { ".svn",             "git"    },
+    { NULL, NULL }
+};
+
+const char *path_project_kind(const char *path)
+{
+    if (!path || path[0] == '\0') return NULL;
+
+    char probe[PATH_MAX];
+    for (size_t i = 0; PROJECT_MARKERS[i].file != NULL; ++i) {
+        int n = snprintf(probe, sizeof(probe), "%s/%s", path, PROJECT_MARKERS[i].file);
+        if (n <= 0 || (size_t)n >= sizeof(probe)) continue;
+        if (path_exists(probe)) {
+            return PROJECT_MARKERS[i].kind;
+        }
+    }
+    return NULL;
+}
+
+bool path_is_project_dir(const char *path)
+{
+    return path_project_kind(path) != NULL;
+}
+
+bool path_write_atomic(const char *filepath, const char *content, size_t len)
+{
+    if (!filepath || (!content && len > 0)) return false;
+
+    char tmp[PATH_MAX];
+    int n = snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", filepath, (long)getpid());
+    if (n <= 0 || (size_t)n >= sizeof(tmp)) return false;
+
+    FILE *fp = fopen(tmp, "w");
+    if (!fp) return false;
+
+    bool ok = (len == 0) || (fwrite(content, 1, len, fp) == len);
+    if (ok && fflush(fp) != 0) ok = false;
+    // fsync before rename: rename is atomic with respect to the directory
+    // entry, but without the fsync the new contents may not have reached disk.
+    if (ok && fsync(fileno(fp)) != 0) ok = false;
+    if (fclose(fp) != 0) ok = false;
+
+    if (!ok || rename(tmp, filepath) != 0) {
+        unlink(tmp);
+        return false;
+    }
+    return true;
 }
 
 bool path_get_config_dir(char *out, size_t out_size)

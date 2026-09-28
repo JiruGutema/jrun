@@ -26,4 +26,28 @@ bool db_age_if_needed(void);
 
 double db_calculate_frecency(double frequency, int64_t last_access, int64_t current_time);
 
+// --- Cached filesystem index -------------------------------------------------
+//
+// Walking every search root on each lookup dominates jrun's runtime, so the
+// result is cached here and replayed until it goes stale. `fingerprint` comes
+// from config_scan_fingerprint(): any change to roots, ignores, depth or
+// symlink handling invalidates the cache immediately rather than after the TTL.
+
+// True when a stored index exists, was built with this fingerprint, and is
+// younger than ttl_seconds. A ttl of 0 always reports false.
+bool db_cache_is_fresh(const char *fingerprint, int ttl_seconds);
+
+// Loads the cached paths. Ownership transfers to the caller, which should
+// release them with scanner_free_paths().
+bool db_cache_load(char ***paths, size_t *count);
+
+// Replaces the stored index in a single transaction.
+bool db_cache_store(char **paths, size_t count, const char *fingerprint);
+
+// Drops the stored index so the next lookup rescans.
+bool db_cache_invalidate(void);
+
+// Number of paths currently cached, for `jrun doctor`.
+bool db_cache_stats(size_t *count, int64_t *built_at);
+
 #endif // JRUN_DATABASE_H_

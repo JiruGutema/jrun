@@ -11,6 +11,11 @@
 #include <limits.h>
 #include <math.h>
 
+// Checking every candidate for project markers costs a handful of stat() calls
+// each. Worth it for a normal result set; skipped when a very loose query
+// matches an implausible number of directories.
+#define PROJECT_PROBE_LIMIT 256
+
 typedef struct {
     char *path;
     size_t index;
@@ -21,6 +26,7 @@ typedef struct {
     Path_Hash_Slot *slots;
     size_t capacity;
     size_t count;
+    bool failed;
 } Path_Hash_Set;
 
 static bool target_looks_like_path(const char *target)
@@ -44,11 +50,18 @@ static inline uint64_t fnv1a_hash(const char *str)
     return h;
 }
 
-static void path_set_init(Path_Hash_Set *set)
+static bool path_set_init(Path_Hash_Set *set)
 {
     set->capacity = 64;
     set->count = 0;
+    set->failed = false;
     set->slots = (Path_Hash_Slot *)calloc(set->capacity, sizeof(Path_Hash_Slot));
+    if (!set->slots) {
+        set->capacity = 0;
+        set->failed = true;
+        return false;
+    }
+    return true;
 }
 
 static void path_set_free(Path_Hash_Set *set)
@@ -65,11 +78,15 @@ static void path_set_free(Path_Hash_Set *set)
     set->count = 0;
 }
 
-static void path_set_grow(Path_Hash_Set *set)
+static bool path_set_grow(Path_Hash_Set *set)
 {
     size_t new_cap = set->capacity * 2;
     Path_Hash_Slot *new_slots = (Path_Hash_Slot *)calloc(new_cap, sizeof(Path_Hash_Slot));
-    if (!new_slots) return;
+    if (!new_slots) {
+        // Refusing to grow would leave insert probing a full table forever.
+        set->failed = true;
+        return false;
+    }
 
     size_t new_mask = new_cap - 1;
     for (size_t i = 0; i < set->capacity; i++) {
@@ -85,6 +102,7 @@ static void path_set_grow(Path_Hash_Set *set)
     free(set->slots);
     set->slots = new_slots;
     set->capacity = new_cap;
+    return true;
 }
 
 static ssize_t path_set_find(const Path_Hash_Set *set, const char *path)
@@ -104,10 +122,18 @@ static ssize_t path_set_find(const Path_Hash_Set *set, const char *path)
     return -1;
 }
 
-static void path_set_insert(Path_Hash_Set *set, const char *path, size_t index)
+static bool path_set_insert(Path_Hash_Set *set, const char *path, size_t index)
 {
+    if (set->failed || !set->slots) return false;
+
     if (set->count * 10 >= set->capacity * 7) {
-        path_set_grow(set);
+        if (!path_set_grow(set)) return false;
+    }
+
+    char *copy = jrun_strdup(path);
+    if (!copy) {
+        set->failed = true;
+        return false;
     }
 
     size_t mask = set->capacity - 1;
@@ -118,10 +144,11 @@ static void path_set_insert(Path_Hash_Set *set, const char *path, size_t index)
         idx = (idx + 1) & mask;
     }
 
-    set->slots[idx].path = jrun_strdup(path);
+    set->slots[idx].path = copy;
     set->slots[idx].index = index;
     set->slots[idx].used = true;
     set->count++;
+    return true;
 }
 
 static int compare_candidates_desc(const void *a, const void *b)
@@ -142,22 +169,89 @@ static int compare_candidates_desc(const void *a, const void *b)
     return strcmp(ca->path, cb->path);
 }
 
+// Turns match quality and visit history into a single ranking number.
+//
+// Quality alone sets the base; having actually visited a directory can only
+// ever raise it. An earlier version reweighted the two inputs based on
+// from_db, which meant a directory you had visited once scored *lower* than an
+// identical one you had never opened, because the heavier frecency weight was
+// applied to a near-zero frecency.
 static double compute_score(double frecency, double match_quality, bool from_db)
 {
-    double norm_freq = frecency / (frecency + 1.0);
     double norm_qual = match_quality / 150.0;
     if (norm_qual < 0.0) norm_qual = 0.0;
     if (norm_qual > 1.0) norm_qual = 1.0;
 
-    double w_freq = from_db ? 0.55 : 0.25;
-    double w_qual = 1.0 - w_freq;
-    double score = (w_freq * norm_freq + w_qual * norm_qual) * 100.0;
+    double base = 25.0 + norm_qual * 75.0;  // 25 .. 100
+    if (!from_db) return base;
 
-    if (from_db && frecency > 8.0) {
-        score *= 1.0 + log2(frecency / 8.0) * 0.08;
+    // norm_freq saturates towards 1, so the boost is generous for the first
+    // few visits and then flattens out instead of running away.
+    double norm_freq = frecency / (frecency + 1.0);
+    double boost = 1.0 + 0.60 * norm_freq;
+    if (frecency > 8.0) {
+        boost += log2(frecency / 8.0) * 0.08;
+    }
+    return base * boost;
+}
+
+// Returns the directory list to match against: the cached index when it is
+// still valid, otherwise a fresh scan which is then cached for next time.
+static bool gather_search_paths(const Jrun_Config *config, bool force_rescan,
+                                char ***out_paths, size_t *out_count)
+{
+    *out_paths = NULL;
+    *out_count = 0;
+
+    char fingerprint[64];
+    config_scan_fingerprint(config, fingerprint, sizeof(fingerprint));
+
+    if (!force_rescan && db_cache_is_fresh(fingerprint, config->cache_ttl)) {
+        if (db_cache_load(out_paths, out_count)) {
+            return true;
+        }
+        jrun_log_debug("scan cache: load failed, falling back to a scan");
     }
 
-    return score;
+    if (!scanner_scan_roots(config, out_paths, out_count)) {
+        return false;
+    }
+
+    if (config->cache_ttl > 0) {
+        db_cache_store(*out_paths, *out_count, fingerprint);
+    }
+    return true;
+}
+
+bool resolver_reindex(const Jrun_Config *config, size_t *out_count)
+{
+    if (!config) return false;
+
+    char **paths = NULL;
+    size_t count = 0;
+    if (!gather_search_paths(config, true, &paths, &count)) {
+        return false;
+    }
+    scanner_free_paths(paths, count);
+    if (out_count) *out_count = count;
+    return true;
+}
+
+// Directories holding a project marker are what people almost always mean, so
+// give them a nudge that can break a tie without overriding a strong frecency
+// or an exact-name match.
+static void apply_project_bonus(Resolve_Candidate *candidates, size_t count)
+{
+    if (count > PROJECT_PROBE_LIMIT) {
+        jrun_log_debug("skipping project detection for %zu candidates", count);
+        return;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        candidates[i].project_kind = path_project_kind(candidates[i].path);
+        if (candidates[i].project_kind) {
+            candidates[i].score *= 1.15;
+        }
+    }
 }
 
 Resolve_Result resolver_resolve(const char *target, const Jrun_Config *config, bool force_scan)
@@ -170,7 +264,7 @@ Resolve_Result resolver_resolve(const char *target, const Jrun_Config *config, b
 
     bool enable_fuzzy = config ? config->fuzzy : true;
     size_t capacity = 32;
-    Resolve_Candidate *candidates = (Resolve_Candidate *)malloc(capacity * sizeof(Resolve_Candidate));
+    Resolve_Candidate *candidates = (Resolve_Candidate *)calloc(capacity, sizeof(Resolve_Candidate));
     if (!candidates) {
         result.status = RESOLVE_NO_MATCH;
         return result;
@@ -206,74 +300,73 @@ Resolve_Result resolver_resolve(const char *target, const Jrun_Config *config, b
             }
 
             Match_Result match = matcher_evaluate_opts(target, db_entries[i].path, enable_fuzzy);
-            if (match.is_match) {
-                ssize_t existing_idx = path_set_find(&candidate_set, db_entries[i].path);
-                if (existing_idx >= 0) {
-                    candidates[existing_idx].from_db = true;
-                    candidates[existing_idx].frecency = db_entries[i].frecency;
-                    candidates[existing_idx].score = compute_score(
-                        db_entries[i].frecency, match.quality_score, true);
-                } else {
-                    bool ok = true;
-                    JRUN_DA_GROW(candidates, count, capacity, 32, ok);
-                    if (!ok) break;
+            if (!match.is_match) continue;
 
-                    char *path_copy = jrun_strdup(db_entries[i].path);
-                    if (!path_copy) break;
+            ssize_t existing_idx = path_set_find(&candidate_set, db_entries[i].path);
+            if (existing_idx >= 0) {
+                candidates[existing_idx].from_db = true;
+                candidates[existing_idx].frecency = db_entries[i].frecency;
+                candidates[existing_idx].score = compute_score(
+                    db_entries[i].frecency, candidates[existing_idx].match_quality, true);
+            } else {
+                bool ok = true;
+                JRUN_DA_GROW(candidates, count, capacity, 32, ok);
+                if (!ok) break;
 
-                    candidates[count].path = path_copy;
-                    candidates[count].frecency = db_entries[i].frecency;
-                    candidates[count].match_quality = match.quality_score;
-                    candidates[count].is_exact_basename = match.is_exact_basename;
-                    candidates[count].from_db = true;
-                    candidates[count].score = compute_score(
-                        db_entries[i].frecency, match.quality_score, true);
-                    path_set_insert(&candidate_set, path_copy, count);
-                    count++;
-                }
+                char *path_copy = jrun_strdup(db_entries[i].path);
+                if (!path_copy) break;
+
+                candidates[count] = (Resolve_Candidate){
+                    .path = path_copy,
+                    .frecency = db_entries[i].frecency,
+                    .match_quality = match.quality_score,
+                    .is_exact_basename = match.is_exact_basename,
+                    .from_db = true,
+                    .score = compute_score(db_entries[i].frecency, match.quality_score, true),
+                };
+                path_set_insert(&candidate_set, path_copy, count);
+                count++;
             }
         }
         db_free_entries(db_entries, db_count);
     }
 
-    bool has_high_confidence_match = false;
-    for (size_t i = 0; i < count; ++i) {
-        if (candidates[i].is_exact_basename || candidates[i].match_quality >= 80.0) {
-            has_high_confidence_match = true;
-            break;
-        }
-    }
-
-    bool unique_exact = (count == 1 && candidates[0].is_exact_basename);
-    bool need_scan = force_scan || (!has_high_confidence_match) || unique_exact;
-    if (need_scan && config) {
+    // The filesystem index is always consulted, not just when the database
+    // comes up short: two directories sharing a name are exactly the case the
+    // interactive selector exists for, and skipping the scan would hide one.
+    // Serving it from the cache is what keeps that affordable.
+    if (config) {
         char **scanned_paths = NULL;
         size_t scanned_count = 0;
-        if (scanner_scan_roots(config, &scanned_paths, &scanned_count)) {
+        if (gather_search_paths(config, force_scan, &scanned_paths, &scanned_count)) {
             for (size_t i = 0; i < scanned_count; ++i) {
                 const char *p = scanned_paths[i];
+                if (path_set_find(&candidate_set, p) >= 0) continue;
+
                 Match_Result match = matcher_evaluate_opts(target, p, enable_fuzzy);
-                if (match.is_match) {
-                    ssize_t existing_idx = path_set_find(&candidate_set, p);
-                    if (existing_idx < 0) {
-                        bool ok = true;
-                        JRUN_DA_GROW(candidates, count, capacity, 32, ok);
-                        if (!ok) break;
+                if (!match.is_match) continue;
 
-                        char *path_copy = jrun_strdup(p);
-                        if (!path_copy) break;
+                // A cached path may have been deleted since the index was
+                // built; never offer a directory that is no longer there.
+                if (!path_is_dir(p)) continue;
 
-                        candidates[count].path = path_copy;
-                        candidates[count].frecency = 1.0;
-                        candidates[count].match_quality = match.quality_score;
-                        candidates[count].is_exact_basename = match.is_exact_basename;
-                        candidates[count].from_db = false;
-                        candidates[count].score = compute_score(
-                            1.0, match.quality_score, false);
-                        path_set_insert(&candidate_set, path_copy, count);
-                        count++;
-                    }
-                }
+                bool ok = true;
+                JRUN_DA_GROW(candidates, count, capacity, 32, ok);
+                if (!ok) break;
+
+                char *path_copy = jrun_strdup(p);
+                if (!path_copy) break;
+
+                candidates[count] = (Resolve_Candidate){
+                    .path = path_copy,
+                    .frecency = 1.0,
+                    .match_quality = match.quality_score,
+                    .is_exact_basename = match.is_exact_basename,
+                    .from_db = false,
+                    .score = compute_score(1.0, match.quality_score, false),
+                };
+                path_set_insert(&candidate_set, path_copy, count);
+                count++;
             }
             scanner_free_paths(scanned_paths, scanned_count);
         }
@@ -289,7 +382,10 @@ Resolve_Result resolver_resolve(const char *target, const Jrun_Config *config, b
         return result;
     }
 
-    // Sort descending by score
+    if (!config || config->prefer_projects) {
+        apply_project_bonus(candidates, count);
+    }
+
     qsort(candidates, count, sizeof(Resolve_Candidate), compare_candidates_desc);
 
     result.candidates = candidates;
@@ -300,8 +396,8 @@ Resolve_Result resolver_resolve(const char *target, const Jrun_Config *config, b
         return result;
     }
 
-    // Check for ambiguity vs high confidence
-    double threshold = (config && config->frecency_threshold > 0.0) ? config->frecency_threshold : DEFAULT_FRECENCY_THRESHOLD;
+    double threshold = (config && config->frecency_threshold > 0.0)
+                     ? config->frecency_threshold : DEFAULT_FRECENCY_THRESHOLD;
 
     // Identical basenames in different places are always a TUI choice.
     if (candidates[0].is_exact_basename && candidates[1].is_exact_basename) {

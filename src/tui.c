@@ -8,107 +8,125 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <termios.h>
+#include <poll.h>
 #include <sys/ioctl.h>
 #include <signal.h>
 #include <ctype.h>
 #include <limits.h>
 #include <stdarg.h>
 
-static void buf_append_str(char *buf, size_t *pos, size_t cap, const char *str)
-{
-    size_t len = strlen(str);
-    if (*pos + len < cap) {
-        memcpy(buf + *pos, str, len);
-        *pos += len;
-        buf[*pos] = '\0';
-    }
-}
+// ---------------------------------------------------------------------------
+// Terminal handle
+//
+// Everything below talks to /dev/tty rather than stdin/stdout. jrun is almost
+// always invoked as `dir=$(jrun --cd foo)` by the shell integration, so stdout
+// is a pipe carrying the result; drawing there would corrupt the output and
+// gating on isatty(stdout) would disable the selector entirely.
+// ---------------------------------------------------------------------------
 
-static void buf_appendf(char *buf, size_t *pos, size_t cap, const char *fmt, ...)
-{
-    va_list args;
-    va_start(args, fmt);
-    int n = vsnprintf(buf + *pos, cap - *pos, fmt, args);
-    va_end(args);
-    if (n > 0 && *pos + (size_t)n < cap) {
-        *pos += (size_t)n;
-    }
-}
+typedef struct {
+    int in_fd;
+    int out_fd;
+    bool owns_fd;
+    struct termios orig;
+    bool raw;
+} Tty;
 
-static int utf8_visual_width(const char *s)
-{
-    int w = 0;
-    while (*s) {
-        unsigned char c = (unsigned char)*s;
-        if ((c & 0xC0) != 0x80) {
-            w++;
-        }
-        s++;
-    }
-    return w;
-}
-
-static void sanitize_display_string(char *dest, const char *src, size_t dest_size)
-{
-    if (!dest || dest_size == 0) return;
-    if (!src) {
-        dest[0] = '\0';
-        return;
-    }
-    size_t d = 0;
-    for (size_t s = 0; src[s] != '\0' && d + 1 < dest_size; ++s) {
-        unsigned char c = (unsigned char)src[s];
-        if (c < 32 || c == 127) {
-            dest[d++] = '?';
-        } else {
-            dest[d++] = (char)c;
-        }
-    }
-    dest[d] = '\0';
-}
-
-static struct termios g_orig_termios;
-static bool g_raw_mode = false;
+static Tty g_tty = { .in_fd = -1, .out_fd = -1, .owns_fd = false, .raw = false };
 static volatile sig_atomic_t g_interrupted = 0;
 static volatile sig_atomic_t g_resized = 0;
 
-static void disable_raw_mode(void)
+static void tty_write(const char *s, size_t len)
 {
-    if (g_raw_mode) {
-        const char *exit_seq = "\x1b[0m\x1b[?25h\x1b[?1049l";
-        (void)write(STDOUT_FILENO, exit_seq, strlen(exit_seq));
-        tcsetattr(STDIN_FILENO, TCSAFLUSH, &g_orig_termios);
-        g_raw_mode = false;
+    if (g_tty.out_fd < 0) return;
+    while (len > 0) {
+        ssize_t n = write(g_tty.out_fd, s, len);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return;
+        }
+        s += n;
+        len -= (size_t)n;
     }
 }
 
-static bool enable_raw_mode(void)
+static void tty_close(void)
 {
-    if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) {
-        return false;
+    if (g_tty.owns_fd && g_tty.in_fd >= 0) {
+        close(g_tty.in_fd);
     }
-    if (tcgetattr(STDIN_FILENO, &g_orig_termios) == -1) {
-        return false;
+    g_tty.in_fd = -1;
+    g_tty.out_fd = -1;
+    g_tty.owns_fd = false;
+}
+
+// Opens the controlling terminal, falling back to the standard streams when
+// /dev/tty is unavailable (some containers, some CI runners).
+static bool tty_open(void)
+{
+    if (g_tty.in_fd >= 0) return true;
+
+    int fd = open("/dev/tty", O_RDWR | O_CLOEXEC);
+    if (fd >= 0) {
+        g_tty.in_fd = fd;
+        g_tty.out_fd = fd;
+        g_tty.owns_fd = true;
+        return true;
     }
+
+    if (isatty(STDIN_FILENO) && isatty(STDOUT_FILENO)) {
+        g_tty.in_fd = STDIN_FILENO;
+        g_tty.out_fd = STDOUT_FILENO;
+        g_tty.owns_fd = false;
+        return true;
+    }
+
+    return false;
+}
+
+bool tui_available(void)
+{
+    if (g_tty.in_fd >= 0) return true;
+
+    int fd = open("/dev/tty", O_RDWR | O_CLOEXEC);
+    if (fd >= 0) {
+        close(fd);
+        return true;
+    }
+    return isatty(STDIN_FILENO) && isatty(STDOUT_FILENO);
+}
+
+static void disable_raw_mode(void)
+{
+    if (!g_tty.raw) return;
+    const char *exit_seq = "\x1b[0m\x1b[?25h\x1b[?1049l";
+    tty_write(exit_seq, strlen(exit_seq));
+    tcsetattr(g_tty.in_fd, TCSAFLUSH, &g_tty.orig);
+    g_tty.raw = false;
+    tty_close();
+}
+
+// A terminal left in raw mode with the alternate screen active is a wrecked
+// shell, so restore on every exit path we can observe.
+static void fatal_signal_handler(int sig)
+{
+    disable_raw_mode();
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static void install_exit_guards(void)
+{
+    static bool installed = false;
+    if (installed) return;
+    installed = true;
     atexit(disable_raw_mode);
-
-    struct termios raw = g_orig_termios;
-    raw.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
-    raw.c_oflag &= ~(OPOST);
-    raw.c_cflag |= (CS8);
-    raw.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
-    raw.c_cc[VMIN] = 0;
-    raw.c_cc[VTIME] = 1;
-
-    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1) {
-        return false;
-    }
-    g_raw_mode = true;
-
-    const char *enter_seq = "\x1b[?1049h\x1b[H\x1b[2J\x1b[?25l";
-    (void)write(STDOUT_FILENO, enter_seq, strlen(enter_seq));
-    return true;
+    signal(SIGTERM, fatal_signal_handler);
+    signal(SIGHUP, fatal_signal_handler);
+    signal(SIGSEGV, fatal_signal_handler);
+    signal(SIGABRT, fatal_signal_handler);
 }
 
 static void sigint_handler(int sig)
@@ -123,6 +141,281 @@ static void sigwinch_handler(int sig)
     g_resized = 1;
 }
 
+static bool enable_raw_mode(void)
+{
+    if (g_tty.raw) return true;
+    if (!tty_open()) return false;
+
+    if (tcgetattr(g_tty.in_fd, &g_tty.orig) == -1) {
+        tty_close();
+        return false;
+    }
+    install_exit_guards();
+
+    struct termios raw = g_tty.orig;
+    raw.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
+    raw.c_oflag &= ~(OPOST);
+    raw.c_cflag |= (CS8);
+    raw.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
+    // Blocking reads; poll() decides when input is available, so the process
+    // uses no CPU at all while it waits.
+    raw.c_cc[VMIN] = 1;
+    raw.c_cc[VTIME] = 0;
+
+    if (tcsetattr(g_tty.in_fd, TCSAFLUSH, &raw) == -1) {
+        tty_close();
+        return false;
+    }
+    g_tty.raw = true;
+
+    const char *enter_seq = "\x1b[?1049h\x1b[H\x1b[2J\x1b[?25l";
+    tty_write(enter_seq, strlen(enter_seq));
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Growable render buffer
+//
+// A fixed buffer silently truncated frames on wide terminals, and truncation
+// in the middle of an escape sequence leaves the display garbled.
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    char *data;
+    size_t len;
+    size_t cap;
+    bool failed;
+} Buf;
+
+static void buf_free(Buf *b)
+{
+    free(b->data);
+    b->data = NULL;
+    b->len = b->cap = 0;
+    b->failed = false;
+}
+
+static void buf_reserve(Buf *b, size_t extra)
+{
+    if (b->failed) return;
+    if (b->len + extra + 1 <= b->cap) return;
+    size_t new_cap = b->cap ? b->cap : 8192;
+    while (new_cap < b->len + extra + 1) new_cap *= 2;
+    char *grown = (char *)realloc(b->data, new_cap);
+    if (!grown) { b->failed = true; return; }
+    b->data = grown;
+    b->cap = new_cap;
+}
+
+static void buf_putn(Buf *b, const char *s, size_t n)
+{
+    buf_reserve(b, n);
+    if (b->failed) return;
+    memcpy(b->data + b->len, s, n);
+    b->len += n;
+    b->data[b->len] = '\0';
+}
+
+static void buf_puts(Buf *b, const char *s)
+{
+    if (s) buf_putn(b, s, strlen(s));
+}
+
+static void buf_putf(Buf *b, const char *fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    char tmp[1024];
+    int n = vsnprintf(tmp, sizeof(tmp), fmt, args);
+    va_end(args);
+    if (n < 0) return;
+    if ((size_t)n < sizeof(tmp)) {
+        buf_putn(b, tmp, (size_t)n);
+        return;
+    }
+    // Rare long line: render it again into an exactly-sized allocation.
+    buf_reserve(b, (size_t)n);
+    if (b->failed) return;
+    va_start(args, fmt);
+    vsnprintf(b->data + b->len, (size_t)n + 1, fmt, args);
+    va_end(args);
+    b->len += (size_t)n;
+}
+
+static void buf_repeat(Buf *b, const char *unit, int times)
+{
+    for (int i = 0; i < times; ++i) buf_puts(b, unit);
+}
+
+static void buf_flush(Buf *b)
+{
+    if (!b->failed && b->data) tty_write(b->data, b->len);
+    b->len = 0;
+    if (b->data) b->data[0] = '\0';
+}
+
+// ---------------------------------------------------------------------------
+// UTF-8 aware measurement
+// ---------------------------------------------------------------------------
+
+// Decodes one code point. Always advances by at least one byte so malformed
+// input cannot stall a render loop.
+static size_t utf8_next(const char *s, uint32_t *cp)
+{
+    unsigned char c = (unsigned char)s[0];
+    if (c < 0x80) { *cp = c; return 1; }
+    if ((c & 0xE0) == 0xC0 && (s[1] & 0xC0) == 0x80) {
+        *cp = ((uint32_t)(c & 0x1F) << 6) | (uint32_t)(s[1] & 0x3F);
+        return 2;
+    }
+    if ((c & 0xF0) == 0xE0 && (s[1] & 0xC0) == 0x80 && (s[2] & 0xC0) == 0x80) {
+        *cp = ((uint32_t)(c & 0x0F) << 12) | ((uint32_t)(s[1] & 0x3F) << 6) |
+              (uint32_t)(s[2] & 0x3F);
+        return 3;
+    }
+    if ((c & 0xF8) == 0xF0 && (s[1] & 0xC0) == 0x80 && (s[2] & 0xC0) == 0x80 &&
+        (s[3] & 0xC0) == 0x80) {
+        *cp = ((uint32_t)(c & 0x07) << 18) | ((uint32_t)(s[1] & 0x3F) << 12) |
+              ((uint32_t)(s[2] & 0x3F) << 6) | (uint32_t)(s[3] & 0x3F);
+        return 4;
+    }
+    *cp = 0xFFFD;
+    return 1;
+}
+
+// Width tables, rather than wcwidth().
+//
+// wcwidth() answers according to the process locale: in the "C" locale it
+// reports -1 for every non-ASCII code point, so CJK names rendered two columns
+// wide by the terminal were measured as one and every row containing one came
+// out too long. These ranges are locale independent and cover what actually
+// turns up in directory names.
+
+typedef struct { uint32_t lo, hi; } Cp_Range;
+
+// Combining marks and zero-width formatting characters occupy no column.
+static const Cp_Range ZERO_WIDTH[] = {
+    { 0x0300, 0x036F }, { 0x0483, 0x0489 }, { 0x0591, 0x05BD },
+    { 0x0610, 0x061A }, { 0x064B, 0x065F }, { 0x0670, 0x0670 },
+    { 0x06D6, 0x06DC }, { 0x0900, 0x0903 }, { 0x093A, 0x094F },
+    { 0x0951, 0x0957 }, { 0x1AB0, 0x1AFF }, { 0x1DC0, 0x1DFF },
+    { 0x200B, 0x200F }, { 0x2060, 0x2064 }, { 0x20D0, 0x20F0 },
+    { 0xFE00, 0xFE0F }, { 0xFE20, 0xFE2F }, { 0xFEFF, 0xFEFF },
+    { 0xE0100, 0xE01EF },
+};
+
+// East Asian Wide and Fullwidth, plus the emoji blocks terminals render wide.
+static const Cp_Range DOUBLE_WIDTH[] = {
+    { 0x1100, 0x115F },   // Hangul Jamo initial consonants
+    { 0x2329, 0x232A },
+    { 0x2E80, 0x303E },   // CJK radicals, Kangxi, CJK symbols
+    { 0x3041, 0x33FF },   // Hiragana, Katakana, Hangul Compatibility, CJK compat
+    { 0x3400, 0x4DBF },   // CJK Extension A
+    { 0x4E00, 0x9FFF },   // CJK Unified Ideographs
+    { 0xA000, 0xA4CF },   // Yi
+    { 0xAC00, 0xD7A3 },   // Hangul syllables
+    { 0xF900, 0xFAFF },   // CJK Compatibility Ideographs
+    { 0xFE10, 0xFE19 },
+    { 0xFE30, 0xFE6F },   // CJK Compatibility Forms
+    { 0xFF00, 0xFF60 },   // Fullwidth forms
+    { 0xFFE0, 0xFFE6 },
+    { 0x16FE0, 0x16FE4 },
+    { 0x17000, 0x18AFF }, // Tangut
+    { 0x1B000, 0x1B2FF },
+    { 0x1F004, 0x1F004 },
+    { 0x1F0CF, 0x1F0CF },
+    { 0x1F18E, 0x1F18E },
+    { 0x1F191, 0x1F19A },
+    { 0x1F200, 0x1F320 },
+    { 0x1F330, 0x1F335 },
+    { 0x1F337, 0x1F37C },
+    { 0x1F380, 0x1F393 },
+    { 0x1F3A0, 0x1F3CA },
+    { 0x1F400, 0x1F4FD },
+    { 0x1F500, 0x1F53D },
+    { 0x1F550, 0x1F567 },
+    { 0x1F600, 0x1F64F },
+    { 0x1F680, 0x1F6C5 },
+    { 0x1F900, 0x1F9FF },
+    { 0x20000, 0x3FFFD }, // CJK Extension B and beyond
+};
+
+static bool cp_in(const Cp_Range *ranges, size_t n, uint32_t cp)
+{
+    size_t lo = 0, hi = n;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (cp < ranges[mid].lo) hi = mid;
+        else if (cp > ranges[mid].hi) lo = mid + 1;
+        else return true;
+    }
+    return false;
+}
+
+static int cp_width(uint32_t cp)
+{
+    if (cp == 0) return 0;
+    if (cp < 0x20 || cp == 0x7f) return 0;
+    if (cp < 0x0300) return 1;  // the overwhelmingly common case
+    if (cp_in(ZERO_WIDTH, sizeof(ZERO_WIDTH) / sizeof(ZERO_WIDTH[0]), cp)) return 0;
+    if (cp_in(DOUBLE_WIDTH, sizeof(DOUBLE_WIDTH) / sizeof(DOUBLE_WIDTH[0]), cp)) return 2;
+    return 1;
+}
+
+static int str_width(const char *s)
+{
+    int w = 0;
+    while (*s) {
+        uint32_t cp;
+        s += utf8_next(s, &cp);
+        w += cp_width(cp);
+    }
+    return w;
+}
+
+// Byte offset at which the trailing `max_w` columns of `s` begin. Sets
+// *needs_ellipsis when the head was cut off.
+static size_t fit_tail(const char *s, int max_w, bool *needs_ellipsis)
+{
+    *needs_ellipsis = false;
+    int total = str_width(s);
+    if (total <= max_w) return 0;
+
+    int budget = max_w - 1; // one column for the ellipsis
+    if (budget < 1) budget = 1;
+
+    // Walk forward recording offsets, then pick the first one whose remaining
+    // width fits. Paths are short enough that this stays trivial.
+    size_t offset = 0;
+    int remaining = total;
+    while (s[offset] && remaining > budget) {
+        uint32_t cp;
+        size_t adv = utf8_next(s + offset, &cp);
+        remaining -= cp_width(cp);
+        offset += adv;
+    }
+    *needs_ellipsis = true;
+    return offset;
+}
+
+static void sanitize_display_string(char *dest, const char *src, size_t dest_size)
+{
+    if (!dest || dest_size == 0) return;
+    if (!src) { dest[0] = '\0'; return; }
+    // One byte in, one byte out, so highlight offsets computed against the
+    // sanitized string still line up with the original.
+    size_t d = 0;
+    for (size_t s = 0; src[s] != '\0' && d + 1 < dest_size; ++s) {
+        unsigned char c = (unsigned char)src[s];
+        dest[d++] = (c < 32 || c == 127) ? '?' : (char)c;
+    }
+    dest[d] = '\0';
+}
+
+// ---------------------------------------------------------------------------
+// Input
+// ---------------------------------------------------------------------------
+
 enum Tui_Key {
     KEY_NONE = 0,
     KEY_CHAR,
@@ -136,10 +429,15 @@ enum Tui_Key {
     KEY_PAGE_DOWN,
     KEY_ENTER,
     KEY_BACKSPACE,
+    KEY_DELETE,
     KEY_CLEAR,
     KEY_KILL_WORD,
+    KEY_KILL_LINE,
+    KEY_LINE_START,
+    KEY_LINE_END,
     KEY_TAB,
     KEY_SAVE,
+    KEY_REFRESH,
     KEY_ESC,
 };
 
@@ -148,61 +446,218 @@ typedef struct {
     char ch;
 } Input_Event;
 
+// Waits for input, returning early when a signal arrives so a resize repaints
+// promptly. timeout_ms < 0 blocks indefinitely; the process is idle meanwhile.
+static bool tty_wait(int timeout_ms)
+{
+    struct pollfd pfd = { .fd = g_tty.in_fd, .events = POLLIN, .revents = 0 };
+    int rc = poll(&pfd, 1, timeout_ms);
+    return rc > 0 && (pfd.revents & POLLIN);
+}
+
+static bool tty_read_byte(char *out, int timeout_ms)
+{
+    if (!tty_wait(timeout_ms)) return false;
+    ssize_t n = read(g_tty.in_fd, out, 1);
+    return n == 1;
+}
+
+// How long to wait for the rest of an escape sequence before concluding the
+// user simply pressed Esc.
+#define ESC_SEQ_TIMEOUT_MS 40
+
 static Input_Event read_input(void)
 {
     char c = 0;
-    ssize_t n = read(STDIN_FILENO, &c, 1);
-    if (n <= 0) return (Input_Event){ .key = KEY_NONE };
+    if (!tty_read_byte(&c, -1)) return (Input_Event){ .key = KEY_NONE };
 
     if (c == '\x1b') {
-        char seq[4] = {0};
-        if (read(STDIN_FILENO, &seq[0], 1) <= 0) return (Input_Event){ .key = KEY_ESC };
-        if (read(STDIN_FILENO, &seq[1], 1) <= 0) return (Input_Event){ .key = KEY_ESC };
+        char seq[8] = {0};
+        if (!tty_read_byte(&seq[0], ESC_SEQ_TIMEOUT_MS)) return (Input_Event){ .key = KEY_ESC };
 
         if (seq[0] == '[') {
+            if (!tty_read_byte(&seq[1], ESC_SEQ_TIMEOUT_MS)) return (Input_Event){ .key = KEY_ESC };
+
             if (seq[1] >= '0' && seq[1] <= '9') {
-                if (read(STDIN_FILENO, &seq[2], 1) <= 0) return (Input_Event){ .key = KEY_ESC };
-                if (seq[2] == '~') {
-                    switch (seq[1]) {
-                    case '1': case '7': return (Input_Event){ .key = KEY_HOME };
-                    case '3': return (Input_Event){ .key = KEY_BACKSPACE };
-                    case '4': case '8': return (Input_Event){ .key = KEY_END };
-                    case '5': return (Input_Event){ .key = KEY_PAGE_UP };
-                    case '6': return (Input_Event){ .key = KEY_PAGE_DOWN };
+                // Numeric form: ESC [ <digits> (;<mods>) ~
+                char digits[8] = { seq[1], 0 };
+                size_t d = 1;
+                char t = 0;
+                while (d + 1 < sizeof(digits) && tty_read_byte(&t, ESC_SEQ_TIMEOUT_MS)) {
+                    if (t >= '0' && t <= '9') { digits[d++] = t; digits[d] = '\0'; continue; }
+                    break;
+                }
+                if (t == ';') {
+                    // Modifier parameters; consume and ignore them.
+                    while (tty_read_byte(&t, ESC_SEQ_TIMEOUT_MS) && t != '~' &&
+                           !(t >= 'A' && t <= 'Z')) {
+                        // keep draining
                     }
                 }
-            } else {
-                switch (seq[1]) {
-                case 'A': return (Input_Event){ .key = KEY_UP };
-                case 'B': return (Input_Event){ .key = KEY_DOWN };
-                case 'C': return (Input_Event){ .key = KEY_RIGHT };
-                case 'D': return (Input_Event){ .key = KEY_LEFT };
-                case 'H': return (Input_Event){ .key = KEY_HOME };
-                case 'F': return (Input_Event){ .key = KEY_END };
+                int code = atoi(digits);
+                switch (code) {
+                case 1: case 7: return (Input_Event){ .key = KEY_HOME };
+                case 3: return (Input_Event){ .key = KEY_DELETE };
+                case 4: case 8: return (Input_Event){ .key = KEY_END };
+                case 5: return (Input_Event){ .key = KEY_PAGE_UP };
+                case 6: return (Input_Event){ .key = KEY_PAGE_DOWN };
+                default: return (Input_Event){ .key = KEY_NONE };
                 }
             }
-        } else if (seq[0] == 'O') {
+
             switch (seq[1]) {
+            case 'A': return (Input_Event){ .key = KEY_UP };
+            case 'B': return (Input_Event){ .key = KEY_DOWN };
+            case 'C': return (Input_Event){ .key = KEY_RIGHT };
+            case 'D': return (Input_Event){ .key = KEY_LEFT };
             case 'H': return (Input_Event){ .key = KEY_HOME };
             case 'F': return (Input_Event){ .key = KEY_END };
+            default:  return (Input_Event){ .key = KEY_NONE };
             }
         }
+
+        if (seq[0] == 'O') {
+            if (!tty_read_byte(&seq[1], ESC_SEQ_TIMEOUT_MS)) return (Input_Event){ .key = KEY_ESC };
+            switch (seq[1]) {
+            case 'A': return (Input_Event){ .key = KEY_UP };
+            case 'B': return (Input_Event){ .key = KEY_DOWN };
+            case 'C': return (Input_Event){ .key = KEY_RIGHT };
+            case 'D': return (Input_Event){ .key = KEY_LEFT };
+            case 'H': return (Input_Event){ .key = KEY_HOME };
+            case 'F': return (Input_Event){ .key = KEY_END };
+            default:  return (Input_Event){ .key = KEY_NONE };
+            }
+        }
+
         return (Input_Event){ .key = KEY_ESC };
     }
 
-    if (c == 13 || c == 10) return (Input_Event){ .key = KEY_ENTER };
-    if (c == 127 || c == 8) return (Input_Event){ .key = KEY_BACKSPACE };
-    if (c == 3) return (Input_Event){ .key = KEY_ESC };
-    if (c == 14) return (Input_Event){ .key = KEY_DOWN };
-    if (c == 16) return (Input_Event){ .key = KEY_UP };
-    if (c == 21) return (Input_Event){ .key = KEY_CLEAR };
-    if (c == 23) return (Input_Event){ .key = KEY_KILL_WORD };
-    if (c == 9) return (Input_Event){ .key = KEY_TAB };
-    if (c == 19) return (Input_Event){ .key = KEY_SAVE };
-    if (c == 4) return (Input_Event){ .key = KEY_ESC };
+    switch (c) {
+    case 13: case 10: return (Input_Event){ .key = KEY_ENTER };
+    case 127: case 8:  return (Input_Event){ .key = KEY_BACKSPACE };
+    case 1:   return (Input_Event){ .key = KEY_LINE_START };  // C-a
+    case 3:   return (Input_Event){ .key = KEY_ESC };         // C-c
+    case 4:   return (Input_Event){ .key = KEY_ESC };         // C-d
+    case 5:   return (Input_Event){ .key = KEY_LINE_END };    // C-e
+    case 9:   return (Input_Event){ .key = KEY_TAB };
+    case 11:  return (Input_Event){ .key = KEY_KILL_LINE };   // C-k
+    case 12:  return (Input_Event){ .key = KEY_REFRESH };     // C-l
+    case 14:  return (Input_Event){ .key = KEY_DOWN };        // C-n
+    case 16:  return (Input_Event){ .key = KEY_UP };          // C-p
+    case 18:  return (Input_Event){ .key = KEY_REFRESH };     // C-r
+    case 19:  return (Input_Event){ .key = KEY_SAVE };        // C-s
+    case 21:  return (Input_Event){ .key = KEY_CLEAR };       // C-u
+    case 23:  return (Input_Event){ .key = KEY_KILL_WORD };   // C-w
+    default: break;
+    }
 
     return (Input_Event){ .key = KEY_CHAR, .ch = c };
 }
+
+// ---------------------------------------------------------------------------
+// Drawing primitives
+// ---------------------------------------------------------------------------
+
+#define SGR_RESET     "\x1b[0m"
+#define SGR_DIM       "\x1b[2m"
+#define SGR_BOLD      "\x1b[1m"
+#define SGR_SELECTED  "\x1b[7m"
+#define SGR_UNSEL     "\x1b[27m"
+#define SGR_ACCENT    "\x1b[36m"
+#define SGR_MATCH     "\x1b[1;33m"
+#define SGR_MATCH_SEL "\x1b[1;4m"
+#define SGR_WARN      "\x1b[1;33m"
+#define SGR_DANGER    "\x1b[1;31m"
+
+typedef struct {
+    int cols;
+    int rows;
+} Term_Size;
+
+static Term_Size get_term_size(void)
+{
+    Term_Size ts = { .cols = 80, .rows = 24 };
+    struct winsize ws;
+    if (g_tty.out_fd >= 0 && ioctl(g_tty.out_fd, TIOCGWINSZ, &ws) != -1 &&
+        ws.ws_col > 0 && ws.ws_row > 0) {
+        ts.cols = ws.ws_col;
+        ts.rows = ws.ws_row;
+    }
+    // Cap the frame on very wide terminals so lines stay scannable. The lower
+    // bound is a genuine floor, not a minimum width: forcing 40 columns on a
+    // 30-column terminal makes every row wrap and destroys the layout.
+    if (ts.cols > 160) ts.cols = 160;
+    if (ts.cols < 20) ts.cols = 20;
+    if (ts.rows < 6) ts.rows = 6;
+    return ts;
+}
+
+static void draw_rule(Buf *b, const char *left, const char *right, int width)
+{
+    buf_puts(b, left);
+    buf_repeat(b, "─", width - 2);
+    buf_puts(b, right);
+    buf_puts(b, "\r\n");
+}
+
+// Top border carrying a title on the left and an optional counter on the right.
+static void draw_title(Buf *b, const char *title, const char *badge, int width)
+{
+    int title_w = str_width(title);
+    int badge_w = badge ? str_width(badge) + 2 : 0;
+
+    // Drop the badge, then trim the title, rather than overflowing the frame.
+    if (4 + title_w + badge_w + 1 > width) {
+        badge = NULL;
+        badge_w = 0;
+    }
+
+    buf_puts(b, "┌─ " SGR_BOLD);
+    int room = width - 5 - badge_w;
+    if (room < 1) room = 1;
+    bool ell = false;
+    size_t from = fit_tail(title, room, &ell);
+    int drawn = 0;
+    if (ell) { buf_puts(b, "…"); drawn = 1; }
+    for (size_t i = from; title[i] && drawn < room; ) {
+        uint32_t cp;
+        size_t adv = utf8_next(title + i, &cp);
+        int w = cp_width(cp);
+        if (drawn + w > room) break;
+        buf_putn(b, title + i, adv);
+        drawn += w;
+        i += adv;
+    }
+    buf_puts(b, SGR_RESET " ");
+
+    int used = 4 + drawn;
+    int fill = width - used - badge_w - 1;
+    if (fill < 0) fill = 0;
+    buf_repeat(b, "─", fill);
+    if (badge) {
+        buf_putf(b, " " SGR_DIM "%s" SGR_RESET " ", badge);
+    }
+    buf_puts(b, "┐\r\n");
+}
+
+static void draw_pad(Buf *b, int n)
+{
+    for (int i = 0; i < n; ++i) buf_puts(b, " ");
+}
+
+// Writes one framed row: "│" + content padded to `inner` columns + "│".
+// The caller emits content and reports the columns it used.
+static void draw_row_end(Buf *b, int inner, int used)
+{
+    int pad = inner - used;
+    if (pad < 0) pad = 0;
+    draw_pad(b, pad);
+    buf_puts(b, SGR_RESET "│\r\n");
+}
+
+// ---------------------------------------------------------------------------
+// Directory selector
+// ---------------------------------------------------------------------------
 
 typedef struct {
     size_t index;
@@ -220,97 +675,56 @@ static int compare_filtered_desc(const void *a, const void *b)
     return 0;
 }
 
-static void get_term_size(int *cols, int *rows)
+// Renders a path, colouring the bytes the query actually matched. `mask` is
+// indexed by byte offset into `text`; `from` is where truncation begins.
+static int draw_highlighted(Buf *b, const char *text, const unsigned char *mask,
+                            size_t from, bool ellipsis, int max_w, bool selected)
 {
-    struct winsize ws;
-    *cols = 80;
-    *rows = 24;
-    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) != -1 && ws.ws_col > 0 && ws.ws_row > 0) {
-        *cols = ws.ws_col;
-        *rows = ws.ws_row;
-    }
-}
+    int used = 0;
+    const char *normal = selected ? SGR_UNSEL SGR_SELECTED : SGR_RESET;
+    const char *accent = selected ? SGR_MATCH_SEL : SGR_MATCH;
 
-static void append_hline(char *buf, size_t *pos, size_t cap, const char *left, const char *right, int width)
-{
-    buf_append_str(buf, pos, cap, left);
-    for (int i = 0; i < width - 2; ++i) buf_append_str(buf, pos, cap, "─");
-    buf_append_str(buf, pos, cap, right);
-    buf_append_str(buf, pos, cap, "\r\n");
-}
-
-static void append_labeled_top(char *buf, size_t *pos, size_t cap, const char *title, int width)
-{
-    buf_appendf(buf, pos, cap, "┌─ %s ", title);
-    int fill = width - 4 - (int)strlen(title);
-    if (fill < 0) fill = 0;
-    for (int i = 0; i < fill; ++i) buf_append_str(buf, pos, cap, "─");
-    buf_append_str(buf, pos, cap, "┐\r\n");
-}
-
-static void pad_to(char *buf, size_t *pos, size_t cap, int n)
-{
-    for (int i = 0; i < n; ++i) buf_append_str(buf, pos, cap, " ");
-}
-
-static void render_highlighted_path(char *buf, size_t *pos, size_t cap,
-                                    const char *path, const char *query,
-                                    int max_width, bool selected)
-{
-    char truncated[PATH_MAX];
-    int vis = utf8_visual_width(path);
-    if (vis > max_width) {
-        int keep = max_width - 3;
-        if (keep < 1) keep = 1;
-        const char *src = path + strlen(path);
-        int taken = 0;
-        while (src > path && taken < keep) {
-            src--;
-            if (((unsigned char)*src & 0xC0) != 0x80) taken++;
-        }
-        snprintf(truncated, sizeof(truncated), "...%s", src);
-    } else {
-        strncpy(truncated, path, sizeof(truncated) - 1);
-        truncated[sizeof(truncated) - 1] = '\0';
+    if (ellipsis) {
+        buf_puts(b, SGR_DIM "…");
+        buf_puts(b, normal);
+        used += 1;
     }
 
-    const char *q = query;
-    int drawn = 0;
-    for (const char *p = truncated; *p; ++p) {
-        bool hit = false;
-        if (q && *q && tolower((unsigned char)*p) == tolower((unsigned char)*q) && *p != '/') {
-            hit = true;
-            q++;
+    bool in_match = false;
+    for (size_t i = from; text[i] && used < max_w; ) {
+        uint32_t cp;
+        size_t adv = utf8_next(text + i, &cp);
+        int w = cp_width(cp);
+        if (used + w > max_w) break;
+
+        bool hit = mask && mask[i];
+        if (hit && !in_match) {
+            buf_puts(b, accent);
+            in_match = true;
+        } else if (!hit && in_match) {
+            buf_puts(b, normal);
+            in_match = false;
         }
-        if (hit) {
-            if (selected) buf_append_str(buf, pos, cap, "\x1b[1;97m");
-            else buf_append_str(buf, pos, cap, "\x1b[1;33m");
-            char ch[2] = { *p, 0 };
-            buf_append_str(buf, pos, cap, ch);
-            if (selected) buf_append_str(buf, pos, cap, "\x1b[1;37;44m");
-            else buf_append_str(buf, pos, cap, "\x1b[0m");
-        } else {
-            char ch[2] = { *p, 0 };
-            buf_append_str(buf, pos, cap, ch);
-        }
-        if (((unsigned char)*p & 0xC0) != 0x80) drawn++;
+
+        buf_putn(b, text + i, adv);
+        used += w;
+        i += adv;
     }
-    if (drawn < max_width) pad_to(buf, pos, cap, max_width - drawn);
+    if (in_match) buf_puts(b, normal);
+    return used;
 }
 
-static void join_argv(char *out, size_t out_size, char *const argv[])
+// A one-column scrollbar drawn just inside the right border, so a long list
+// shows at a glance how much of it is off screen.
+static const char *scrollbar_cell(size_t total, size_t visible, size_t offset, int row, int height)
 {
-    if (!out || out_size == 0) return;
-    out[0] = '\0';
-    size_t pos = 0;
-    for (int i = 0; argv && argv[i]; ++i) {
-        int n = snprintf(out + pos, out_size - pos, "%s%s", i ? " " : "", argv[i]);
-        if (n < 0 || pos + (size_t)n >= out_size) {
-            out[out_size - 1] = '\0';
-            return;
-        }
-        pos += (size_t)n;
-    }
+    if (total <= visible) return " ";
+    // Thumb size and position, both clamped to at least one cell.
+    int thumb = (int)((double)visible / (double)total * height);
+    if (thumb < 1) thumb = 1;
+    int max_off = (int)(total - visible);
+    int pos = max_off > 0 ? (int)((double)offset / (double)max_off * (height - thumb)) : 0;
+    return (row >= pos && row < pos + thumb) ? "█" : "░";
 }
 
 char *tui_select(const Resolve_Candidate *candidates, size_t count, const char *initial_query)
@@ -318,13 +732,15 @@ char *tui_select(const Resolve_Candidate *candidates, size_t count, const char *
     if (!candidates || count == 0) return NULL;
 
     if (!enable_raw_mode()) {
-        jrun_log_error("failed to initialize terminal raw mode for TUI");
+        jrun_log_error("no terminal available for the interactive selector");
         return NULL;
     }
 
     struct sigaction sa, old_sa, sa_win, old_win;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = sigint_handler;
+    g_interrupted = 0;
+    g_resized = 0;
     sigaction(SIGINT, &sa, &old_sa);
     memset(&sa_win, 0, sizeof(sa_win));
     sa_win.sa_handler = sigwinch_handler;
@@ -332,15 +748,17 @@ char *tui_select(const Resolve_Candidate *candidates, size_t count, const char *
 
     char query[256];
     size_t qlen = 0;
+    size_t qcursor = 0;
     if (initial_query) {
-        strncpy(query, initial_query, sizeof(query) - 1);
-        query[sizeof(query) - 1] = '\0';
+        snprintf(query, sizeof(query), "%s", initial_query);
         qlen = strlen(query);
     } else {
         query[0] = '\0';
     }
+    qcursor = qlen;
 
     Filtered_Item *filtered = (Filtered_Item *)malloc(count * sizeof(Filtered_Item));
+    Buf buf = {0};
     if (!filtered) {
         disable_raw_mode();
         sigaction(SIGINT, &old_sa, NULL);
@@ -371,8 +789,15 @@ char *tui_select(const Resolve_Candidate *candidates, size_t count, const char *
                 } else {
                     Match_Result m = matcher_evaluate(query, candidates[i].path);
                     if (m.is_match) {
+                        // Scale the resolver's score by how well this row
+                        // matches the live query. Ranking on an unrelated
+                        // formula would order the list in a way the score
+                        // column visibly contradicts.
+                        double quality = m.quality_score / 150.0;
+                        if (quality > 1.0) quality = 1.0;
+                        if (quality < 0.05) quality = 0.05;
                         filtered[filtered_count].index = i;
-                        filtered[filtered_count].score = (candidates[i].frecency + 0.5) * m.quality_score;
+                        filtered[filtered_count].score = candidates[i].score * quality;
                         filtered_count++;
                     }
                 }
@@ -388,163 +813,285 @@ char *tui_select(const Resolve_Candidate *candidates, size_t count, const char *
             needs_redraw = true;
         }
 
-        int cols = 80;
-        int rows = 24;
-        get_term_size(&cols, &rows);
+        Term_Size ts = get_term_size();
+        int width = ts.cols;
+        int inner = width - 2;
 
-        int box_width = cols;
-        if (box_width < 40) box_width = 40;
-
-        int chrome = 7;
-        int list_height = rows - chrome;
+        // Frame chrome: title, query, two rules, footer, bottom.
+        const int chrome = 6;
+        int list_height = ts.rows - chrome;
         if (list_height < 3) list_height = 3;
+        if ((size_t)list_height > filtered_count && filtered_count > 0) {
+            list_height = (int)filtered_count;
+        }
+        if (list_height < 1) list_height = 1;
 
         if (selected < scroll_offset) {
             scroll_offset = selected;
         } else if (selected >= scroll_offset + (size_t)list_height) {
             scroll_offset = selected - (size_t)list_height + 1;
         }
+        if (filtered_count <= (size_t)list_height) scroll_offset = 0;
 
         if (needs_redraw) {
-            char buf[16384];
-            size_t buf_pos = 0;
-            buf_append_str(buf, &buf_pos, sizeof(buf), "\x1b[H\x1b[?25l");
+            buf.len = 0;
+            buf_puts(&buf, "\x1b[H\x1b[?25l");
 
-            char title[64];
-            snprintf(title, sizeof(title), "Select directory  %zu/%zu", filtered_count, count);
-            append_labeled_top(buf, &buf_pos, sizeof(buf), title, box_width);
+            char badge[32];
+            snprintf(badge, sizeof(badge), "%zu/%zu", filtered_count, count);
+            draw_title(&buf, "Jump to", badge, width);
 
+            // Query line.
             char safe_query[256];
             sanitize_display_string(safe_query, query, sizeof(safe_query));
-            buf_append_str(buf, &buf_pos, sizeof(buf), "│ Search: \x1b[1m");
-            buf_append_str(buf, &buf_pos, sizeof(buf), safe_query);
-            buf_append_str(buf, &buf_pos, sizeof(buf), "\x1b[0m");
-            int search_fill = box_width - 10 - utf8_visual_width(safe_query);
-            if (search_fill < 0) search_fill = 0;
-            pad_to(buf, &buf_pos, sizeof(buf), search_fill);
-            buf_append_str(buf, &buf_pos, sizeof(buf), "│\r\n");
+            buf_puts(&buf, "│ ");
+            buf_puts(&buf, filtered_count ? SGR_ACCENT "❯ " SGR_RESET : SGR_DANGER "❯ " SGR_RESET);
+            buf_puts(&buf, SGR_BOLD);
+            buf_puts(&buf, safe_query);
+            buf_puts(&buf, SGR_RESET);
+            draw_row_end(&buf, inner, 3 + str_width(safe_query));
 
-            append_hline(buf, &buf_pos, sizeof(buf), "├", "┤", box_width);
+            draw_rule(&buf, "├", "┤", width);
 
             for (int row = 0; row < list_height; ++row) {
                 size_t item_idx = scroll_offset + (size_t)row;
-                buf_append_str(buf, &buf_pos, sizeof(buf), "│");
-                int inner_width = box_width - 2;
+                buf_puts(&buf, "│");
 
-                if (item_idx < filtered_count) {
-                    size_t cand_idx = filtered[item_idx].index;
-                    const Resolve_Candidate *cand = &candidates[cand_idx];
-                    char raw_display_path[PATH_MAX];
-                    char display_path[PATH_MAX];
-                    path_shorten_tilde(cand->path, raw_display_path, sizeof(raw_display_path));
-                    sanitize_display_string(display_path, raw_display_path, sizeof(display_path));
-
-                    bool is_sel = (item_idx == selected);
-                    char score_txt[16];
-                    snprintf(score_txt, sizeof(score_txt), "%5.1f", cand->score);
-                    int score_w = 6;
-                    int path_max = inner_width - 4 - score_w;
-                    if (path_max < 4) path_max = 4;
-
-                    if (is_sel) buf_append_str(buf, &buf_pos, sizeof(buf), "\x1b[1;37;44m");
-                    buf_append_str(buf, &buf_pos, sizeof(buf), is_sel ? "❯ " : "  ");
-                    render_highlighted_path(buf, &buf_pos, sizeof(buf), display_path, query,
-                                            path_max, is_sel);
-                    buf_appendf(buf, &buf_pos, sizeof(buf), " \x1b[2m%s\x1b[0m", score_txt);
-                    if (is_sel) buf_append_str(buf, &buf_pos, sizeof(buf), "\x1b[0m");
-                } else {
-                    pad_to(buf, &buf_pos, sizeof(buf), inner_width);
+                if (item_idx >= filtered_count) {
+                    draw_pad(&buf, inner);
+                    buf_puts(&buf, "│\r\n");
+                    continue;
                 }
-                buf_append_str(buf, &buf_pos, sizeof(buf), "│\r\n");
+
+                const Resolve_Candidate *cand = &candidates[filtered[item_idx].index];
+                bool is_sel = (item_idx == selected);
+
+                char raw_path[PATH_MAX];
+                char disp[PATH_MAX];
+                path_shorten_tilde(cand->path, raw_path, sizeof(raw_path));
+                sanitize_display_string(disp, raw_path, sizeof(disp));
+
+                unsigned char mask[PATH_MAX];
+                size_t disp_len = strlen(disp);
+                if (qlen > 0) {
+                    matcher_highlight(query, disp, mask, disp_len);
+                } else {
+                    memset(mask, 0, disp_len);
+                }
+
+                // Optional columns are dropped as the terminal narrows; the
+                // path itself is the only thing that must always be readable.
+                bool show_score = (inner >= 46);
+                bool show_kind = (inner >= 34);
+
+                char score_txt[16];
+                snprintf(score_txt, sizeof(score_txt), "%6.1f", cand->score);
+                const char *kind = show_kind ? cand->project_kind : NULL;
+                int kind_w = kind ? (int)strlen(kind) + 1 : 0;
+                int score_w = show_score ? 7 : 0;
+                int scroll_w = (filtered_count > (size_t)list_height) ? 1 : 0;
+
+                // 2 columns for the cursor gutter, 1 spacer before the score.
+                int path_w = inner - 2 - score_w - kind_w - scroll_w;
+                if (path_w < 6) path_w = 6;
+
+                if (is_sel) buf_puts(&buf, SGR_SELECTED);
+                buf_puts(&buf, is_sel ? "❯ " : "  ");
+
+                bool ellipsis = false;
+                size_t from = fit_tail(disp, path_w, &ellipsis);
+                int used = 2 + draw_highlighted(&buf, disp, mask, from, ellipsis, path_w, is_sel);
+                draw_pad(&buf, path_w - (used - 2));
+                used = 2 + path_w;
+
+                if (kind) {
+                    if (!is_sel) buf_puts(&buf, SGR_ACCENT);
+                    buf_putf(&buf, " %s", kind);
+                    if (!is_sel) buf_puts(&buf, SGR_RESET);
+                    used += kind_w;
+                }
+
+                if (show_score) {
+                    if (!is_sel) buf_puts(&buf, SGR_DIM);
+                    buf_putf(&buf, " %s", score_txt);
+                    used += score_w;
+                    if (!is_sel) buf_puts(&buf, SGR_RESET);
+                }
+
+                // Pad before clearing the attribute so the selection bar
+                // reaches the frame rather than stopping at the score.
+                draw_pad(&buf, inner - used - scroll_w);
+                if (is_sel) buf_puts(&buf, SGR_RESET);
+
+                if (scroll_w) {
+                    buf_puts(&buf, SGR_DIM);
+                    buf_puts(&buf, scrollbar_cell(filtered_count, (size_t)list_height,
+                                                  scroll_offset, row, list_height));
+                    buf_puts(&buf, SGR_RESET);
+                }
+                buf_puts(&buf, "│\r\n");
             }
 
-            append_hline(buf, &buf_pos, sizeof(buf), "├", "┤", box_width);
+            draw_rule(&buf, "├", "┤", width);
 
-            const char *footer_text = "↑↓/C-n/C-p  Enter select  C-u clear  C-w word  Esc cancel";
-            buf_appendf(buf, &buf_pos, sizeof(buf), "│ \x1b[90m%s\x1b[0m", footer_text);
-            int footer_fill = box_width - 4 - utf8_visual_width(footer_text);
-            if (footer_fill < 0) footer_fill = 0;
-            pad_to(buf, &buf_pos, sizeof(buf), footer_fill);
-            buf_append_str(buf, &buf_pos, sizeof(buf), " │\r\n");
-            append_hline(buf, &buf_pos, sizeof(buf), "└", "┘", box_width);
-            buf_append_str(buf, &buf_pos, sizeof(buf), "\x1b[J");
+            const char *footer = (width >= 62)
+                ? "↑↓ move · ⏎ open · ^W word · ^U clear · esc cancel"
+                : (width >= 30) ? "↑↓ · ⏎ open · esc" : "⏎ · esc";
+            buf_puts(&buf, "│ " SGR_DIM);
+            buf_puts(&buf, footer);
+            buf_puts(&buf, SGR_RESET);
+            draw_row_end(&buf, inner, 1 + str_width(footer));
 
-            int cursor_col = 10 + utf8_visual_width(safe_query);
-            if (cursor_col < box_width - 1) {
-                buf_appendf(buf, &buf_pos, sizeof(buf), "\x1b[2;%dH\x1b[?25h", cursor_col + 1);
-            }
+            draw_rule(&buf, "└", "┘", width);
+            buf_puts(&buf, "\x1b[J");
 
-            (void)write(STDOUT_FILENO, buf, buf_pos);
+            // Park the real cursor in the query so the terminal's own caret
+            // marks the edit position.
+            char before[256];
+            size_t n = qcursor < sizeof(before) ? qcursor : sizeof(before) - 1;
+            memcpy(before, safe_query, n);
+            before[n] = '\0';
+            int cursor_col = 5 + str_width(before);
+            buf_putf(&buf, "\x1b[2;%dH\x1b[?25h", cursor_col);
+
+            buf_flush(&buf);
             needs_redraw = false;
         }
 
         Input_Event ev = read_input();
-        if (ev.key == KEY_NONE) {
-            continue;
-        }
+        if (ev.key == KEY_NONE) continue;
 
-        if (ev.key == KEY_ESC) {
-            break;
-        }
+        switch (ev.key) {
+        case KEY_ESC:
+            goto done;
 
-        if (ev.key == KEY_ENTER) {
+        case KEY_ENTER:
             if (filtered_count > 0 && selected < filtered_count) {
                 result_path = jrun_strdup(candidates[filtered[selected].index].path);
             }
+            goto done;
+
+        case KEY_UP:
+            if (selected > 0) selected--;
+            else if (filtered_count) selected = filtered_count - 1;  // wrap
+            needs_redraw = true;
+            break;
+
+        case KEY_DOWN:
+            if (selected + 1 < filtered_count) selected++;
+            else selected = 0;  // wrap
+            needs_redraw = true;
+            break;
+
+        case KEY_HOME:
+            selected = 0;
+            needs_redraw = true;
+            break;
+
+        case KEY_END:
+            if (filtered_count > 0) selected = filtered_count - 1;
+            needs_redraw = true;
+            break;
+
+        case KEY_PAGE_UP:
+            selected = (selected >= (size_t)list_height) ? selected - (size_t)list_height : 0;
+            needs_redraw = true;
+            break;
+
+        case KEY_PAGE_DOWN:
+            selected += (size_t)list_height;
+            if (filtered_count > 0 && selected >= filtered_count) selected = filtered_count - 1;
+            needs_redraw = true;
+            break;
+
+        case KEY_LEFT:
+            if (qcursor > 0) qcursor--;
+            needs_redraw = true;
+            break;
+
+        case KEY_RIGHT:
+            if (qcursor < qlen) qcursor++;
+            needs_redraw = true;
+            break;
+
+        case KEY_LINE_START:
+            qcursor = 0;
+            needs_redraw = true;
+            break;
+
+        case KEY_LINE_END:
+            qcursor = qlen;
+            needs_redraw = true;
+            break;
+
+        case KEY_REFRESH:
+            needs_redraw = true;
+            break;
+
+        case KEY_BACKSPACE:
+            if (qcursor > 0) {
+                memmove(query + qcursor - 1, query + qcursor, qlen - qcursor + 1);
+                qcursor--;
+                qlen--;
+                selected = 0;
+                needs_filter = true;
+            }
+            break;
+
+        case KEY_DELETE:
+            if (qcursor < qlen) {
+                memmove(query + qcursor, query + qcursor + 1, qlen - qcursor);
+                qlen--;
+                selected = 0;
+                needs_filter = true;
+            }
+            break;
+
+        case KEY_KILL_LINE:
+            query[qcursor] = '\0';
+            qlen = qcursor;
+            selected = 0;
+            needs_filter = true;
+            break;
+
+        case KEY_CLEAR:
+            query[0] = '\0';
+            qlen = 0;
+            qcursor = 0;
+            selected = 0;
+            needs_filter = true;
+            break;
+
+        case KEY_KILL_WORD: {
+            size_t end = qcursor;
+            while (qcursor > 0 && query[qcursor - 1] == ' ') qcursor--;
+            while (qcursor > 0 && query[qcursor - 1] != ' ' && query[qcursor - 1] != '/') qcursor--;
+            memmove(query + qcursor, query + end, qlen - end + 1);
+            qlen -= (end - qcursor);
+            selected = 0;
+            needs_filter = true;
             break;
         }
 
-        if (ev.key == KEY_UP) {
-            if (selected > 0) selected--;
-            needs_redraw = true;
-        } else if (ev.key == KEY_DOWN) {
-            if (selected + 1 < filtered_count) selected++;
-            needs_redraw = true;
-        } else if (ev.key == KEY_HOME) {
-            selected = 0;
-            needs_redraw = true;
-        } else if (ev.key == KEY_END) {
-            if (filtered_count > 0) selected = filtered_count - 1;
-            needs_redraw = true;
-        } else if (ev.key == KEY_PAGE_UP) {
-            if (selected >= (size_t)list_height) selected -= (size_t)list_height;
-            else selected = 0;
-            needs_redraw = true;
-        } else if (ev.key == KEY_PAGE_DOWN) {
-            selected += (size_t)list_height;
-            if (selected >= filtered_count && filtered_count > 0) {
-                selected = filtered_count - 1;
-            }
-            needs_redraw = true;
-        } else if (ev.key == KEY_BACKSPACE) {
-            if (qlen > 0) {
-                query[--qlen] = '\0';
-                selected = 0;
-                needs_filter = true;
-            }
-        } else if (ev.key == KEY_CLEAR) {
-            query[0] = '\0';
-            qlen = 0;
-            selected = 0;
-            needs_filter = true;
-        } else if (ev.key == KEY_KILL_WORD) {
-            while (qlen > 0 && query[qlen - 1] == ' ') query[--qlen] = '\0';
-            while (qlen > 0 && query[qlen - 1] != ' ' && query[qlen - 1] != '/') {
-                query[--qlen] = '\0';
-            }
-            selected = 0;
-            needs_filter = true;
-        } else if (ev.key == KEY_CHAR) {
+        case KEY_CHAR:
             if (isprint((unsigned char)ev.ch) && qlen + 1 < sizeof(query)) {
-                query[qlen++] = ev.ch;
-                query[qlen] = '\0';
+                memmove(query + qcursor + 1, query + qcursor, qlen - qcursor + 1);
+                query[qcursor] = ev.ch;
+                qcursor++;
+                qlen++;
                 selected = 0;
                 needs_filter = true;
             }
+            break;
+
+        default:
+            break;
         }
     }
 
+done:
     free(filtered);
+    buf_free(&buf);
     disable_raw_mode();
     sigaction(SIGINT, &old_sa, NULL);
     sigaction(SIGWINCH, &old_win, NULL);
@@ -552,13 +1099,23 @@ char *tui_select(const Resolve_Candidate *candidates, size_t count, const char *
     return result_path;
 }
 
-static bool confirm_fallback(const char *working_dir, const char *cmdline)
+// ---------------------------------------------------------------------------
+// Destructive-command confirmation
+// ---------------------------------------------------------------------------
+
+static void join_argv(char *out, size_t out_size, char *const argv[])
 {
-    fprintf(stderr, "jrun: run in %s?\n  %s\nConfirm [y/N]: ", working_dir, cmdline);
-    fflush(stderr);
-    char line[32];
-    if (!fgets(line, sizeof(line), stdin)) return false;
-    return line[0] == 'y' || line[0] == 'Y';
+    if (!out || out_size == 0) return;
+    out[0] = '\0';
+    size_t pos = 0;
+    for (int i = 0; argv && argv[i]; ++i) {
+        int n = snprintf(out + pos, out_size - pos, "%s%s", i ? " " : "", argv[i]);
+        if (n < 0 || pos + (size_t)n >= out_size) {
+            out[out_size - 1] = '\0';
+            return;
+        }
+        pos += (size_t)n;
+    }
 }
 
 bool tui_confirm_command(const char *working_dir, char *const argv[])
@@ -571,119 +1128,139 @@ bool tui_confirm_command(const char *working_dir, char *const argv[])
     char short_dir[PATH_MAX];
     path_shorten_tilde(working_dir, short_dir, sizeof(short_dir));
 
-    if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) {
-        jrun_log_error("refusing destructive command '%s' without a TTY (pass -y to skip)", argv[0]);
+    if (!enable_raw_mode()) {
+        jrun_log_error("refusing destructive command '%s' without a terminal (pass -y to skip)",
+                       argv[0]);
         return false;
     }
 
-    if (!enable_raw_mode()) {
-        return confirm_fallback(short_dir, cmdline);
-    }
-
-    struct sigaction sa, old_sa;
+    struct sigaction sa, old_sa, sa_win, old_win;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = sigint_handler;
     g_interrupted = 0;
+    g_resized = 0;
     sigaction(SIGINT, &sa, &old_sa);
+    memset(&sa_win, 0, sizeof(sa_win));
+    sa_win.sa_handler = sigwinch_handler;
+    sigaction(SIGWINCH, &sa_win, &old_win);
 
+    Buf buf = {0};
     bool confirmed = false;
     bool done = false;
-    int choice = 0; // 0 = No, 1 = Yes
+    // Defaults to "No": a mis-typed Enter must never run the command.
+    int choice = 0;
+    bool needs_redraw = true;
 
     while (!g_interrupted && !done) {
-        int cols = 80, rows = 24;
-        get_term_size(&cols, &rows);
-        int box_width = cols;
-        if (box_width > 100) box_width = 100;
-        if (box_width < 40) box_width = cols;
+        if (g_resized) { g_resized = 0; needs_redraw = true; }
 
-        char safe_cmd[1024];
-        char safe_dir[PATH_MAX];
-        sanitize_display_string(safe_cmd, cmdline, sizeof(safe_cmd));
-        sanitize_display_string(safe_dir, short_dir, sizeof(safe_dir));
+        Term_Size ts = get_term_size();
+        int width = ts.cols > 100 ? 100 : ts.cols;
+        int inner = width - 2;
 
-        char buf[8192];
-        size_t buf_pos = 0;
-        buf_append_str(buf, &buf_pos, sizeof(buf), "\x1b[H\x1b[?25l");
-        append_labeled_top(buf, &buf_pos, sizeof(buf), "Confirm destructive command", box_width);
+        if (needs_redraw) {
+            buf.len = 0;
+            buf_puts(&buf, "\x1b[H\x1b[?25l");
+            draw_title(&buf, "Confirm destructive command", NULL, width);
 
-        buf_append_str(buf, &buf_pos, sizeof(buf), "│ Directory: ");
-        int dir_fill = box_width - 14 - utf8_visual_width(safe_dir);
-        buf_append_str(buf, &buf_pos, sizeof(buf), "\x1b[1m");
-        buf_append_str(buf, &buf_pos, sizeof(buf), safe_dir);
-        buf_append_str(buf, &buf_pos, sizeof(buf), "\x1b[0m");
-        if (dir_fill < 0) dir_fill = 0;
-        pad_to(buf, &buf_pos, sizeof(buf), dir_fill);
-        buf_append_str(buf, &buf_pos, sizeof(buf), "│\r\n");
+            char safe_dir[PATH_MAX];
+            char safe_cmd[1024];
+            sanitize_display_string(safe_dir, short_dir, sizeof(safe_dir));
+            sanitize_display_string(safe_cmd, cmdline, sizeof(safe_cmd));
 
-        buf_append_str(buf, &buf_pos, sizeof(buf), "│ Command:   ");
-        buf_append_str(buf, &buf_pos, sizeof(buf), "\x1b[1;31m");
-        int cmd_max = box_width - 14;
-        if (utf8_visual_width(safe_cmd) > cmd_max && cmd_max > 3) {
-            safe_cmd[cmd_max - 3] = '\0';
-            buf_append_str(buf, &buf_pos, sizeof(buf), safe_cmd);
-            buf_append_str(buf, &buf_pos, sizeof(buf), "...");
-        } else {
-            buf_append_str(buf, &buf_pos, sizeof(buf), safe_cmd);
-            int cmd_fill = cmd_max - utf8_visual_width(safe_cmd);
-            if (cmd_fill < 0) cmd_fill = 0;
-            pad_to(buf, &buf_pos, sizeof(buf), cmd_fill);
+            const char *dir_label = " Directory  ";
+            buf_puts(&buf, "│");
+            buf_puts(&buf, SGR_DIM);
+            buf_puts(&buf, dir_label);
+            buf_puts(&buf, SGR_RESET);
+            int avail = inner - (int)strlen(dir_label) - 1;
+            bool ell = false;
+            size_t from = fit_tail(safe_dir, avail, &ell);
+            int used = (int)strlen(dir_label) + draw_highlighted(&buf, safe_dir, NULL, from, ell, avail, false);
+            draw_row_end(&buf, inner, used);
+
+            const char *cmd_label = " Command    ";
+            buf_puts(&buf, "│");
+            buf_puts(&buf, SGR_DIM);
+            buf_puts(&buf, cmd_label);
+            buf_puts(&buf, SGR_DANGER);
+            avail = inner - (int)strlen(cmd_label) - 1;
+            ell = false;
+            from = fit_tail(safe_cmd, avail, &ell);
+            used = (int)strlen(cmd_label) + draw_highlighted(&buf, safe_cmd, NULL, from, ell, avail, false);
+            buf_puts(&buf, SGR_RESET);
+            draw_row_end(&buf, inner, used);
+
+            draw_rule(&buf, "├", "┤", width);
+
+            buf_puts(&buf, "│  ");
+            if (choice == 0) {
+                buf_puts(&buf, SGR_SELECTED " No " SGR_RESET "   Yes ");
+            } else {
+                buf_puts(&buf, " No " SGR_DANGER SGR_SELECTED "   Yes " SGR_RESET);
+            }
+            // "  " + " No " + "   Yes " -- both branches draw the same 13
+            // visible columns and differ only in attributes.
+            draw_row_end(&buf, inner, 2 + 4 + 7);
+
+            draw_rule(&buf, "├", "┤", width);
+            const char *footer = "←→ choose · y confirm · n/esc cancel";
+            buf_puts(&buf, "│ " SGR_DIM);
+            buf_puts(&buf, footer);
+            buf_puts(&buf, SGR_RESET);
+            draw_row_end(&buf, inner, 1 + str_width(footer));
+            draw_rule(&buf, "└", "┘", width);
+            buf_puts(&buf, "\x1b[J");
+            buf_flush(&buf);
+            needs_redraw = false;
         }
-        buf_append_str(buf, &buf_pos, sizeof(buf), "\x1b[0m│\r\n");
-
-        append_hline(buf, &buf_pos, sizeof(buf), "├", "┤", box_width);
-        buf_append_str(buf, &buf_pos, sizeof(buf), "│ ");
-        if (choice == 0) buf_append_str(buf, &buf_pos, sizeof(buf), "\x1b[1;37;44m❯ No \x1b[0m  Yes ");
-        else buf_append_str(buf, &buf_pos, sizeof(buf), "  No  \x1b[1;37;41m❯ Yes\x1b[0m");
-        pad_to(buf, &buf_pos, sizeof(buf), box_width - 16);
-        buf_append_str(buf, &buf_pos, sizeof(buf), "│\r\n");
-
-        append_hline(buf, &buf_pos, sizeof(buf), "├", "┤", box_width);
-        const char *footer = "←→ choose   y confirm   n/Esc cancel";
-        buf_appendf(buf, &buf_pos, sizeof(buf), "│ \x1b[90m%s\x1b[0m", footer);
-        int ff = box_width - 4 - utf8_visual_width(footer);
-        if (ff < 0) ff = 0;
-        pad_to(buf, &buf_pos, sizeof(buf), ff);
-        buf_append_str(buf, &buf_pos, sizeof(buf), " │\r\n");
-        append_hline(buf, &buf_pos, sizeof(buf), "└", "┘", box_width);
-        buf_append_str(buf, &buf_pos, sizeof(buf), "\x1b[J");
-        (void)write(STDOUT_FILENO, buf, buf_pos);
-        (void)rows;
 
         Input_Event ev = read_input();
         if (ev.key == KEY_NONE) continue;
-        if (ev.key == KEY_ESC) break;
-        if (ev.key == KEY_LEFT || ev.key == KEY_UP) {
+        needs_redraw = true;
+
+        switch (ev.key) {
+        case KEY_ESC:
+            done = true;
+            break;
+        case KEY_LEFT: case KEY_UP:
             choice = 0;
-        } else if (ev.key == KEY_RIGHT || ev.key == KEY_DOWN) {
+            break;
+        case KEY_RIGHT: case KEY_DOWN: case KEY_TAB:
             choice = 1;
-        } else if (ev.key == KEY_ENTER) {
+            break;
+        case KEY_ENTER:
             confirmed = (choice == 1);
             done = true;
-        } else if (ev.key == KEY_CHAR) {
-            if (ev.ch == 'y' || ev.ch == 'Y') {
-                confirmed = true;
-                done = true;
-            } else if (ev.ch == 'n' || ev.ch == 'N') {
-                confirmed = false;
-                done = true;
-            } else if (ev.ch == 'h') {
-                choice = 0;
-            } else if (ev.ch == 'l') {
-                choice = 1;
-            }
+            break;
+        case KEY_CHAR:
+            if (ev.ch == 'y' || ev.ch == 'Y') { confirmed = true; done = true; }
+            else if (ev.ch == 'n' || ev.ch == 'N' || ev.ch == 'q') { confirmed = false; done = true; }
+            else if (ev.ch == 'h') choice = 0;
+            else if (ev.ch == 'l') choice = 1;
+            break;
+        default:
+            break;
         }
     }
 
+    buf_free(&buf);
     disable_raw_mode();
     sigaction(SIGINT, &old_sa, NULL);
+    sigaction(SIGWINCH, &old_win, NULL);
     return confirmed;
 }
+
+// ---------------------------------------------------------------------------
+// Configuration editor
+// ---------------------------------------------------------------------------
 
 enum Cfg_Item_Type {
     CFG_HEADER = 0,
     CFG_ADD_ROOT,
     CFG_ROOT,
+    CFG_ADD_IGNORE,
+    CFG_IGNORE,
     CFG_BOOL,
     CFG_INT,
     CFG_DOUBLE,
@@ -691,18 +1268,23 @@ enum Cfg_Item_Type {
     CFG_CMD,
 };
 
-enum Cfg_Bool_Field {
+enum Cfg_Field {
     CFG_FOLLOW_SYMLINKS = 0,
     CFG_FUZZY,
     CFG_INTERACTIVE,
+    CFG_PREFER_PROJECTS,
     CFG_CONFIRM,
+    CFG_MAX_DEPTH,
+    CFG_CACHE_TTL,
+    CFG_FRECENCY,
 };
 
 typedef struct {
     int type;
     const char *label;
+    const char *help;
     size_t index;
-    int bool_field;
+    int field;
 } Cfg_Item;
 
 enum Cfg_Mode {
@@ -715,33 +1297,78 @@ static bool *cfg_bool_ptr(Jrun_Config *cfg, int field)
 {
     switch (field) {
     case CFG_FOLLOW_SYMLINKS: return &cfg->follow_symlinks;
-    case CFG_FUZZY: return &cfg->fuzzy;
-    case CFG_INTERACTIVE: return &cfg->interactive;
-    case CFG_CONFIRM: return &cfg->confirm_destructive;
+    case CFG_FUZZY:           return &cfg->fuzzy;
+    case CFG_INTERACTIVE:     return &cfg->interactive;
+    case CFG_PREFER_PROJECTS: return &cfg->prefer_projects;
+    case CFG_CONFIRM:         return &cfg->confirm_destructive;
     default: return NULL;
     }
 }
 
+static int *cfg_int_ptr(Jrun_Config *cfg, int field)
+{
+    switch (field) {
+    case CFG_MAX_DEPTH: return &cfg->max_depth;
+    case CFG_CACHE_TTL: return &cfg->cache_ttl;
+    default: return NULL;
+    }
+}
+
+static void cfg_int_range(int field, int *lo, int *hi, int *step)
+{
+    switch (field) {
+    case CFG_MAX_DEPTH: *lo = 1; *hi = 32;    *step = 1;  break;
+    case CFG_CACHE_TTL: *lo = 0; *hi = 86400; *step = 60; break;
+    default:            *lo = 0; *hi = 0;     *step = 1;  break;
+    }
+}
+
+#define CFG_MAX_ITEMS 512
+
 static size_t cfg_build_items(Jrun_Config *cfg, Cfg_Item *items, size_t cap)
 {
     size_t n = 0;
-    if (n < cap) items[n++] = (Cfg_Item){ .type = CFG_HEADER, .label = "Search roots  [search]" };
-    if (n < cap) items[n++] = (Cfg_Item){ .type = CFG_ADD_ROOT, .label = "+ Add root…" };
+    #define PUSH(...) do { if (n < cap) items[n++] = (Cfg_Item){ __VA_ARGS__ }; } while (0)
+
+    PUSH(.type = CFG_HEADER, .label = "SEARCH ROOTS");
+    PUSH(.type = CFG_ADD_ROOT, .label = "+ add a root",
+         .help = "directories jrun indexes");
     for (size_t i = 0; i < cfg->roots_count && n < cap; ++i) {
-        items[n++] = (Cfg_Item){ .type = CFG_ROOT, .label = cfg->roots[i], .index = i };
+        PUSH(.type = CFG_ROOT, .label = cfg->roots[i], .index = i);
     }
-    if (n < cap) items[n++] = (Cfg_Item){ .type = CFG_HEADER, .label = "Behavior  [behavior]" };
-    if (n < cap) items[n++] = (Cfg_Item){ .type = CFG_BOOL, .label = "fuzzy", .bool_field = CFG_FUZZY };
-    if (n < cap) items[n++] = (Cfg_Item){ .type = CFG_BOOL, .label = "interactive", .bool_field = CFG_INTERACTIVE };
-    if (n < cap) items[n++] = (Cfg_Item){ .type = CFG_BOOL, .label = "follow_symlinks", .bool_field = CFG_FOLLOW_SYMLINKS };
-    if (n < cap) items[n++] = (Cfg_Item){ .type = CFG_INT, .label = "max_depth" };
-    if (n < cap) items[n++] = (Cfg_Item){ .type = CFG_DOUBLE, .label = "frecency_threshold" };
-    if (n < cap) items[n++] = (Cfg_Item){ .type = CFG_HEADER, .label = "Safety  [safety]" };
-    if (n < cap) items[n++] = (Cfg_Item){ .type = CFG_BOOL, .label = "confirm", .bool_field = CFG_CONFIRM };
-    if (n < cap) items[n++] = (Cfg_Item){ .type = CFG_ADD_CMD, .label = "+ Add command…" };
+
+    PUSH(.type = CFG_HEADER, .label = "IGNORED DIRECTORY NAMES");
+    PUSH(.type = CFG_ADD_IGNORE, .label = "+ add an ignore",
+         .help = "never descended into during a scan");
+    for (size_t i = 0; i < cfg->ignore_count && n < cap; ++i) {
+        PUSH(.type = CFG_IGNORE, .label = cfg->ignore[i], .index = i);
+    }
+
+    PUSH(.type = CFG_HEADER, .label = "BEHAVIOR");
+    PUSH(.type = CFG_BOOL, .label = "fuzzy", .field = CFG_FUZZY,
+         .help = "match loose subsequences, not just prefixes");
+    PUSH(.type = CFG_BOOL, .label = "interactive", .field = CFG_INTERACTIVE,
+         .help = "show the selector when several directories match");
+    PUSH(.type = CFG_BOOL, .label = "prefer_projects", .field = CFG_PREFER_PROJECTS,
+         .help = "rank .git / Cargo.toml / package.json directories higher");
+    PUSH(.type = CFG_BOOL, .label = "follow_symlinks", .field = CFG_FOLLOW_SYMLINKS,
+         .help = "descend through symlinked directories");
+    PUSH(.type = CFG_INT, .label = "max_depth", .field = CFG_MAX_DEPTH,
+         .help = "how deep below each root to index");
+    PUSH(.type = CFG_INT, .label = "cache_ttl", .field = CFG_CACHE_TTL,
+         .help = "seconds the directory index stays valid; 0 rescans each time");
+    PUSH(.type = CFG_DOUBLE, .label = "frecency_threshold", .field = CFG_FRECENCY,
+         .help = "how far ahead the top match must be to skip the selector");
+
+    PUSH(.type = CFG_HEADER, .label = "SAFETY");
+    PUSH(.type = CFG_BOOL, .label = "confirm", .field = CFG_CONFIRM,
+         .help = "prompt before running the commands listed below");
+    PUSH(.type = CFG_ADD_CMD, .label = "+ add a command",
+         .help = "commands that require confirmation");
     for (size_t i = 0; i < cfg->confirm_commands_count && n < cap; ++i) {
-        items[n++] = (Cfg_Item){ .type = CFG_CMD, .label = cfg->confirm_commands[i], .index = i };
+        PUSH(.type = CFG_CMD, .label = cfg->confirm_commands[i], .index = i);
     }
+    #undef PUSH
     return n;
 }
 
@@ -750,26 +1377,30 @@ static bool cfg_item_selectable(int type)
     return type != CFG_HEADER;
 }
 
+static bool cfg_is_list_entry(int type)
+{
+    return type == CFG_ROOT || type == CFG_IGNORE || type == CFG_CMD;
+}
+
 static void cfg_skip(Cfg_Item *items, size_t count, size_t *sel, int dir)
 {
     if (count == 0) return;
     for (size_t step = 0; step < count; ++step) {
-        if (dir > 0) {
-            *sel = (*sel + 1) % count;
-        } else {
-            *sel = (*sel == 0) ? count - 1 : *sel - 1;
-        }
+        if (dir > 0) *sel = (*sel + 1) % count;
+        else *sel = (*sel == 0) ? count - 1 : *sel - 1;
         if (cfg_item_selectable(items[*sel].type)) return;
     }
 }
 
-static bool cfg_commit_input(Jrun_Config *cfg, Cfg_Item *cur, const char *text, char *status, size_t status_sz)
+static bool cfg_commit_input(Jrun_Config *cfg, int kind, int field, const char *text,
+                             char *status, size_t status_sz)
 {
     if (!text || text[0] == '\0') {
         snprintf(status, status_sz, "cancelled");
         return false;
     }
-    if (cur->type == CFG_ADD_ROOT) {
+
+    if (kind == CFG_ADD_ROOT) {
         char shortp[PATH_MAX];
         char norm[PATH_MAX];
         const char *store = text;
@@ -778,48 +1409,96 @@ static bool cfg_commit_input(Jrun_Config *cfg, Cfg_Item *cur, const char *text, 
             store = shortp;
         }
         if (config_add_root(cfg, store)) {
-            snprintf(status, status_sz, "added root %s", store);
+            // %.120s: the status line is 256 bytes and a root can be PATH_MAX.
+            snprintf(status, status_sz, "added root %.120s", store);
             return true;
         }
-        snprintf(status, status_sz, "failed to add root");
+        snprintf(status, status_sz, "could not add that root");
         return false;
     }
-    if (cur->type == CFG_ADD_CMD) {
+
+    if (kind == CFG_ADD_IGNORE) {
+        if (config_add_ignore(cfg, text)) {
+            snprintf(status, status_sz, "ignoring %.120s", text);
+            return true;
+        }
+        snprintf(status, status_sz, "could not add that ignore");
+        return false;
+    }
+
+    if (kind == CFG_ADD_CMD) {
         if (config_add_confirm_command(cfg, text)) {
-            snprintf(status, status_sz, "added command %s", text);
+            snprintf(status, status_sz, "%.120s now needs confirmation", text);
             return true;
         }
-        snprintf(status, status_sz, "failed to add command");
+        snprintf(status, status_sz, "could not add that command");
         return false;
     }
-    if (cur->type == CFG_INT) {
+
+    if (kind == CFG_INT) {
+        int *p = cfg_int_ptr(cfg, field);
+        if (!p) return false;
+        int lo, hi, step;
+        cfg_int_range(field, &lo, &hi, &step);
         int v = atoi(text);
-        if (v < 1 || v > 32) {
-            snprintf(status, status_sz, "max_depth must be 1–32");
+        if (v < lo || v > hi) {
+            snprintf(status, status_sz, "value must be between %d and %d", lo, hi);
             return false;
         }
-        cfg->max_depth = v;
-        snprintf(status, status_sz, "max_depth = %d", v);
+        *p = v;
+        snprintf(status, status_sz, "set to %d", v);
         return true;
     }
-    if (cur->type == CFG_DOUBLE) {
+
+    if (kind == CFG_DOUBLE) {
         double v = atof(text);
         if (v <= 0.0) {
-            snprintf(status, status_sz, "frecency_threshold must be > 0");
+            snprintf(status, status_sz, "frecency_threshold must be greater than 0");
             return false;
         }
         cfg->frecency_threshold = v;
         snprintf(status, status_sz, "frecency_threshold = %.2f", v);
         return true;
     }
+
     return false;
+}
+
+// Formats the value column for one row.
+static void cfg_value_text(Jrun_Config *cfg, const Cfg_Item *it, char *out, size_t out_size)
+{
+    out[0] = '\0';
+    switch (it->type) {
+    case CFG_BOOL: {
+        bool *p = cfg_bool_ptr(cfg, it->field);
+        snprintf(out, out_size, "%s", (p && *p) ? "on" : "off");
+        break;
+    }
+    case CFG_INT: {
+        int *p = cfg_int_ptr(cfg, it->field);
+        if (p) snprintf(out, out_size, "%d", *p);
+        break;
+    }
+    case CFG_DOUBLE:
+        snprintf(out, out_size, "%.2f", cfg->frecency_threshold);
+        break;
+    case CFG_ROOT: {
+        char expanded[PATH_MAX];
+        if (path_expand_tilde(it->label, expanded, sizeof(expanded)) && !path_is_dir(expanded)) {
+            snprintf(out, out_size, "missing");
+        }
+        break;
+    }
+    default:
+        break;
+    }
 }
 
 bool tui_edit_config(Jrun_Config *config, const char *filepath)
 {
     if (!config || !filepath) return false;
     if (!enable_raw_mode()) {
-        jrun_log_error("failed to initialize terminal raw mode for config TUI");
+        jrun_log_error("no terminal available for the configuration editor");
         return false;
     }
 
@@ -827,48 +1506,52 @@ bool tui_edit_config(Jrun_Config *config, const char *filepath)
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = sigint_handler;
     g_interrupted = 0;
+    g_resized = 0;
     sigaction(SIGINT, &sa, &old_sa);
     memset(&sa_win, 0, sizeof(sa_win));
     sa_win.sa_handler = sigwinch_handler;
     sigaction(SIGWINCH, &sa_win, &old_win);
 
-    Cfg_Item items[256];
-    size_t item_count = cfg_build_items(config, items, 256);
-    size_t selected = 1;
+    Cfg_Item *items = (Cfg_Item *)malloc(CFG_MAX_ITEMS * sizeof(Cfg_Item));
+    Buf buf = {0};
+    if (!items) {
+        disable_raw_mode();
+        sigaction(SIGINT, &old_sa, NULL);
+        sigaction(SIGWINCH, &old_win, NULL);
+        return false;
+    }
+
+    size_t item_count = cfg_build_items(config, items, CFG_MAX_ITEMS);
+    size_t selected = 0;
     size_t scroll_offset = 0;
     int mode = CFG_MODE_NAV;
     int input_kind = CFG_ADD_ROOT;
+    int input_field = 0;
     char input[PATH_MAX];
     size_t ilen = 0;
     input[0] = '\0';
     char status[256];
-    snprintf(status, sizeof(status), "editing %s", filepath);
+    snprintf(status, sizeof(status), "%s", filepath);
     bool dirty = false;
     bool running = true;
     bool needs_redraw = true;
 
-    if (selected >= item_count || !cfg_item_selectable(items[selected].type)) {
-        selected = 0;
-        cfg_skip(items, item_count, &selected, 1);
-    }
+    cfg_skip(items, item_count, &selected, 1);
 
     while (!g_interrupted && running) {
-        if (g_resized) {
-            g_resized = 0;
-            needs_redraw = true;
-        }
+        if (g_resized) { g_resized = 0; needs_redraw = true; }
 
-        item_count = cfg_build_items(config, items, 256);
-        if (selected >= item_count) selected = item_count ? item_count - 1 : 0;
-        if (item_count > 0 && !cfg_item_selectable(items[selected].type)) {
+        item_count = cfg_build_items(config, items, CFG_MAX_ITEMS);
+        if (item_count == 0) break;
+        if (selected >= item_count) selected = item_count - 1;
+        if (!cfg_item_selectable(items[selected].type)) {
             cfg_skip(items, item_count, &selected, 1);
         }
 
-        int cols = 80, rows = 24;
-        get_term_size(&cols, &rows);
-        int box_width = cols;
-        if (box_width < 40) box_width = 40;
-        int list_height = rows - 6;
+        Term_Size ts = get_term_size();
+        int width = ts.cols > 110 ? 110 : ts.cols;
+        int inner = width - 2;
+        int list_height = ts.rows - 6;
         if (list_height < 5) list_height = 5;
 
         if (selected < scroll_offset) scroll_offset = selected;
@@ -877,114 +1560,130 @@ bool tui_edit_config(Jrun_Config *config, const char *filepath)
         }
 
         if (needs_redraw) {
-            char buf[16384];
-            size_t buf_pos = 0;
-            buf_append_str(buf, &buf_pos, sizeof(buf), "\x1b[H\x1b[?25l");
-            char title[96];
-            snprintf(title, sizeof(title), "jrun config%s", dirty ? "  • modified" : "  • saved");
-            append_labeled_top(buf, &buf_pos, sizeof(buf), title, box_width);
+            buf.len = 0;
+            buf_puts(&buf, "\x1b[H\x1b[?25l");
+            draw_title(&buf, "jrun config", dirty ? "unsaved" : "saved", width);
+
+            int scroll_w = (item_count > (size_t)list_height) ? 1 : 0;
 
             for (int row = 0; row < list_height; ++row) {
                 size_t idx = scroll_offset + (size_t)row;
-                buf_append_str(buf, &buf_pos, sizeof(buf), "│");
-                int inner = box_width - 2;
-                if (idx < item_count) {
-                    Cfg_Item *it = &items[idx];
-                    bool is_sel = (idx == selected && mode != CFG_MODE_QUIT);
-                    char line[PATH_MAX + 64];
-                    line[0] = '\0';
-                    if (it->type == CFG_HEADER) {
-                        snprintf(line, sizeof(line), "%s", it->label);
-                    } else if (it->type == CFG_BOOL) {
-                        bool *p = cfg_bool_ptr(config, it->bool_field);
-                        snprintf(line, sizeof(line), "%-22s %s", it->label, (p && *p) ? "true" : "false");
-                    } else if (it->type == CFG_INT) {
-                        snprintf(line, sizeof(line), "%-22s %d", it->label, config->max_depth);
-                    } else if (it->type == CFG_DOUBLE) {
-                        snprintf(line, sizeof(line), "%-22s %.2f", it->label, config->frecency_threshold);
-                    } else if (it->type == CFG_ROOT) {
-                        char expanded[PATH_MAX];
-                        const char *note = "";
-                        if (path_expand_tilde(it->label, expanded, sizeof(expanded))) {
-                            note = path_is_dir(expanded) ? "" : "  (missing)";
-                        }
-                        snprintf(line, sizeof(line), "  %s%s", it->label, note);
-                    } else if (it->type == CFG_CMD) {
-                        snprintf(line, sizeof(line), "  %s", it->label);
-                    } else {
-                        snprintf(line, sizeof(line), "%s", it->label);
-                    }
+                buf_puts(&buf, "│");
 
-                    char safe[PATH_MAX + 64];
-                    sanitize_display_string(safe, line, sizeof(safe));
-                    int vis = utf8_visual_width(safe);
-                    if (vis > inner - 2) {
-                        safe[inner - 5] = '\0';
-                        vis = utf8_visual_width(safe);
-                    }
-
-                    if (it->type == CFG_HEADER) {
-                        buf_append_str(buf, &buf_pos, sizeof(buf), "\x1b[1;36m ");
-                        buf_append_str(buf, &buf_pos, sizeof(buf), safe);
-                        buf_append_str(buf, &buf_pos, sizeof(buf), "\x1b[0m");
-                        pad_to(buf, &buf_pos, sizeof(buf), inner - 1 - vis);
-                    } else if (is_sel) {
-                        buf_append_str(buf, &buf_pos, sizeof(buf), "\x1b[1;37;44m❯");
-                        buf_append_str(buf, &buf_pos, sizeof(buf), safe);
-                        pad_to(buf, &buf_pos, sizeof(buf), inner - 1 - vis);
-                        buf_append_str(buf, &buf_pos, sizeof(buf), "\x1b[0m");
-                    } else {
-                        buf_append_str(buf, &buf_pos, sizeof(buf), " ");
-                        buf_append_str(buf, &buf_pos, sizeof(buf), safe);
-                        pad_to(buf, &buf_pos, sizeof(buf), inner - 1 - vis);
-                    }
-                } else {
-                    pad_to(buf, &buf_pos, sizeof(buf), inner);
+                if (idx >= item_count) {
+                    draw_pad(&buf, inner);
+                    buf_puts(&buf, "│\r\n");
+                    continue;
                 }
-                buf_append_str(buf, &buf_pos, sizeof(buf), "│\r\n");
+
+                Cfg_Item *it = &items[idx];
+                bool is_sel = (idx == selected && mode == CFG_MODE_NAV);
+                int used = 0;
+
+                if (it->type == CFG_HEADER) {
+                    // Blank spacer above every section but the first.
+                    buf_puts(&buf, SGR_DIM SGR_BOLD " ");
+                    char safe[128];
+                    sanitize_display_string(safe, it->label, sizeof(safe));
+                    buf_puts(&buf, safe);
+                    buf_puts(&buf, SGR_RESET);
+                    used = 1 + str_width(safe);
+                    draw_pad(&buf, inner - used - scroll_w);
+                } else {
+                    char safe_label[PATH_MAX];
+                    char value[64];
+                    sanitize_display_string(safe_label, it->label, sizeof(safe_label));
+                    cfg_value_text(config, it, value, sizeof(value));
+
+                    int value_w = (int)strlen(value);
+                    int label_w = inner - 4 - (value_w ? value_w + 2 : 0) - scroll_w;
+                    if (label_w < 8) label_w = 8;
+
+                    if (is_sel) buf_puts(&buf, SGR_SELECTED);
+                    buf_puts(&buf, is_sel ? " ❯ " : "   ");
+                    used = 3;
+
+                    if (cfg_is_list_entry(it->type) && !is_sel) buf_puts(&buf, SGR_DIM);
+                    bool ell = false;
+                    size_t from = fit_tail(safe_label, label_w, &ell);
+                    used += draw_highlighted(&buf, safe_label, NULL, from, ell, label_w, is_sel);
+                    if (cfg_is_list_entry(it->type) && !is_sel) buf_puts(&buf, SGR_RESET);
+                    draw_pad(&buf, label_w - (used - 3));
+                    used = 3 + label_w;
+
+                    if (value_w) {
+                        bool off = (strcmp(value, "off") == 0 || strcmp(value, "missing") == 0);
+                        if (!is_sel) buf_puts(&buf, off ? SGR_DIM : SGR_ACCENT);
+                        buf_putf(&buf, "  %s", value);
+                        if (!is_sel) buf_puts(&buf, SGR_RESET);
+                        used += value_w + 2;
+                    }
+                    // Pad first, clear the attribute after, so the selection
+                    // bar runs the full width of the row.
+                    draw_pad(&buf, inner - used - scroll_w);
+                    if (is_sel) buf_puts(&buf, SGR_RESET);
+                }
+
+                if (scroll_w) {
+                    buf_puts(&buf, SGR_DIM);
+                    buf_puts(&buf, scrollbar_cell(item_count, (size_t)list_height,
+                                                  scroll_offset, row, list_height));
+                    buf_puts(&buf, SGR_RESET);
+                }
+                buf_puts(&buf, "│\r\n");
             }
 
-            append_hline(buf, &buf_pos, sizeof(buf), "├", "┤", box_width);
+            draw_rule(&buf, "├", "┤", width);
 
-            char prompt[PATH_MAX + 32];
+            // Status line: the prompt when editing, otherwise the selected
+            // item's one-line explanation, falling back to the last action.
+            char prompt[PATH_MAX + 64];
+            const char *prefix = "";
             if (mode == CFG_MODE_INPUT) {
-                snprintf(prompt, sizeof(prompt), "%s%s",
-                         (input_kind == CFG_ADD_ROOT) ? "Root path: " :
-                         (input_kind == CFG_ADD_CMD) ? "Command: " : "Value: ",
-                         input);
+                prefix = (input_kind == CFG_ADD_ROOT)   ? "root path: "
+                       : (input_kind == CFG_ADD_IGNORE) ? "ignore name: "
+                       : (input_kind == CFG_ADD_CMD)    ? "command: "
+                       : "value: ";
+                snprintf(prompt, sizeof(prompt), "%s%s", prefix, input);
             } else if (mode == CFG_MODE_QUIT) {
-                snprintf(prompt, sizeof(prompt), "Unsaved changes. Save?  y / n / esc");
+                snprintf(prompt, sizeof(prompt), "Unsaved changes — save before leaving?  y / n / esc");
+            } else if (selected < item_count && items[selected].help) {
+                snprintf(prompt, sizeof(prompt), "%s", items[selected].help);
             } else {
                 snprintf(prompt, sizeof(prompt), "%s", status);
             }
-            char safe_p[PATH_MAX + 32];
-            sanitize_display_string(safe_p, prompt, sizeof(safe_p));
-            buf_append_str(buf, &buf_pos, sizeof(buf), "│ ");
-            if (mode == CFG_MODE_QUIT) buf_append_str(buf, &buf_pos, sizeof(buf), "\x1b[1;33m");
-            else if (mode == CFG_MODE_INPUT) buf_append_str(buf, &buf_pos, sizeof(buf), "\x1b[1m");
-            buf_append_str(buf, &buf_pos, sizeof(buf), safe_p);
-            buf_append_str(buf, &buf_pos, sizeof(buf), "\x1b[0m");
-            int pf = box_width - 4 - utf8_visual_width(safe_p);
-            if (pf < 0) pf = 0;
-            pad_to(buf, &buf_pos, sizeof(buf), pf);
-            buf_append_str(buf, &buf_pos, sizeof(buf), " │\r\n");
 
-            append_hline(buf, &buf_pos, sizeof(buf), "├", "┤", box_width);
-            const char *footer = "↑↓  Enter/Space  a add  d del  +/-  C-s save  q quit";
-            buf_appendf(buf, &buf_pos, sizeof(buf), "│ \x1b[90m%s\x1b[0m", footer);
-            int ff = box_width - 4 - utf8_visual_width(footer);
-            if (ff < 0) ff = 0;
-            pad_to(buf, &buf_pos, sizeof(buf), ff);
-            buf_append_str(buf, &buf_pos, sizeof(buf), " │\r\n");
-            append_hline(buf, &buf_pos, sizeof(buf), "└", "┘", box_width);
-            buf_append_str(buf, &buf_pos, sizeof(buf), "\x1b[J");
+            char safe_p[PATH_MAX + 64];
+            sanitize_display_string(safe_p, prompt, sizeof(safe_p));
+            buf_puts(&buf, "│ ");
+            if (mode == CFG_MODE_QUIT) buf_puts(&buf, SGR_WARN);
+            else if (mode == CFG_MODE_INPUT) buf_puts(&buf, SGR_BOLD);
+            else buf_puts(&buf, SGR_DIM);
+
+            bool ell = false;
+            size_t from = fit_tail(safe_p, inner - 2, &ell);
+            int used = 1 + draw_highlighted(&buf, safe_p, NULL, from, ell, inner - 2, false);
+            buf_puts(&buf, SGR_RESET);
+            draw_row_end(&buf, inner, used);
+
+            draw_rule(&buf, "├", "┤", width);
+            const char *footer = (mode == CFG_MODE_INPUT)
+                ? "⏎ accept · esc cancel"
+                : "↑↓ move · ⏎ edit · a add · d delete · ←→ adjust · ^S save · q quit";
+            buf_puts(&buf, "│ " SGR_DIM);
+            buf_puts(&buf, footer);
+            buf_puts(&buf, SGR_RESET);
+            draw_row_end(&buf, inner, 1 + str_width(footer));
+            draw_rule(&buf, "└", "┘", width);
+            buf_puts(&buf, "\x1b[J");
 
             if (mode == CFG_MODE_INPUT) {
-                int col = 3 + utf8_visual_width(safe_p);
-                buf_appendf(buf, &buf_pos, sizeof(buf), "\x1b[%d;%dH\x1b[?25h", rows - 3, col);
+                int col = 3 + str_width(safe_p);
+                if (col > width - 1) col = width - 1;
+                buf_putf(&buf, "\x1b[%d;%dH\x1b[?25h", ts.rows - 2, col);
             }
 
-            (void)write(STDOUT_FILENO, buf, buf_pos);
+            buf_flush(&buf);
             needs_redraw = false;
         }
 
@@ -997,15 +1696,7 @@ bool tui_edit_config(Jrun_Config *config, const char *filepath)
                 mode = CFG_MODE_NAV;
                 snprintf(status, sizeof(status), "cancelled");
             } else if (ev.key == KEY_ENTER) {
-                Cfg_Item dummy = { .type = input_kind };
-                if (selected < item_count &&
-                    (items[selected].type == CFG_INT || items[selected].type == CFG_DOUBLE ||
-                     items[selected].type == CFG_ADD_ROOT || items[selected].type == CFG_ADD_CMD)) {
-                    dummy = items[selected];
-                } else {
-                    dummy.type = input_kind;
-                }
-                if (cfg_commit_input(config, &dummy, input, status, sizeof(status))) {
+                if (cfg_commit_input(config, input_kind, input_field, input, status, sizeof(status))) {
                     dirty = true;
                 }
                 mode = CFG_MODE_NAV;
@@ -1027,15 +1718,17 @@ bool tui_edit_config(Jrun_Config *config, const char *filepath)
             if (ev.key == KEY_ESC) {
                 mode = CFG_MODE_NAV;
                 snprintf(status, sizeof(status), "still editing");
-            } else if (ev.key == KEY_CHAR && (ev.ch == 'y' || ev.ch == 'Y' || ev.ch == 's' || ev.ch == 'S')) {
+            } else if (ev.key == KEY_CHAR && (ev.ch == 'y' || ev.ch == 'Y' || ev.ch == 's')) {
                 if (config_save(config, filepath)) {
                     dirty = false;
                     running = false;
                 } else {
-                    snprintf(status, sizeof(status), "save failed");
+                    snprintf(status, sizeof(status), "could not write %s", filepath);
                     mode = CFG_MODE_NAV;
                 }
             } else if (ev.key == KEY_CHAR && (ev.ch == 'n' || ev.ch == 'N')) {
+                // Discard: reload from disk so the caller keeps a config that
+                // matches what is actually stored.
                 config_free(config);
                 config_load(config, filepath);
                 dirty = false;
@@ -1049,104 +1742,134 @@ bool tui_edit_config(Jrun_Config *config, const char *filepath)
         if (ev.key == KEY_ESC || (ev.key == KEY_CHAR && (ev.ch == 'q' || ev.ch == 'Q'))) {
             if (dirty) mode = CFG_MODE_QUIT;
             else running = false;
-        } else if (ev.key == KEY_SAVE || (ev.key == KEY_CHAR && ev.ch == 's')) {
+            continue;
+        }
+        if (ev.key == KEY_SAVE || (ev.key == KEY_CHAR && ev.ch == 's')) {
             if (config_save(config, filepath)) {
                 dirty = false;
-                snprintf(status, sizeof(status), "wrote %s", filepath);
+                snprintf(status, sizeof(status), "saved to %s", filepath);
             } else {
-                snprintf(status, sizeof(status), "save failed");
+                snprintf(status, sizeof(status), "could not write %s", filepath);
             }
-        } else if (ev.key == KEY_UP) {
-            cfg_skip(items, item_count, &selected, -1);
-        } else if (ev.key == KEY_DOWN) {
-            cfg_skip(items, item_count, &selected, 1);
-        } else if (ev.key == KEY_TAB) {
-            size_t start = selected;
-            do {
-                cfg_skip(items, item_count, &selected, 1);
-                if (items[selected].type == CFG_ADD_ROOT ||
-                    (items[selected].type == CFG_BOOL && items[selected].bool_field == CFG_FUZZY) ||
-                    (items[selected].type == CFG_BOOL && items[selected].bool_field == CFG_CONFIRM)) {
-                    break;
-                }
-            } while (selected != start);
-        } else if (ev.key == KEY_HOME) {
+            continue;
+        }
+        if (ev.key == KEY_UP)   { cfg_skip(items, item_count, &selected, -1); continue; }
+        if (ev.key == KEY_DOWN) { cfg_skip(items, item_count, &selected, 1);  continue; }
+        if (ev.key == KEY_PAGE_UP) {
+            for (int i = 0; i < list_height; ++i) cfg_skip(items, item_count, &selected, -1);
+            continue;
+        }
+        if (ev.key == KEY_PAGE_DOWN) {
+            for (int i = 0; i < list_height; ++i) cfg_skip(items, item_count, &selected, 1);
+            continue;
+        }
+        if (ev.key == KEY_HOME) {
             selected = 0;
             cfg_skip(items, item_count, &selected, 1);
-        } else if (ev.key == KEY_END) {
-            selected = item_count ? item_count - 1 : 0;
-            if (item_count && !cfg_item_selectable(items[selected].type)) {
+            continue;
+        }
+        if (ev.key == KEY_END) {
+            selected = item_count - 1;
+            if (!cfg_item_selectable(items[selected].type)) {
                 cfg_skip(items, item_count, &selected, -1);
             }
-        } else if (!cur) {
             continue;
-        } else if (ev.key == KEY_ENTER || (ev.key == KEY_CHAR && ev.ch == ' ')) {
+        }
+        if (!cur) continue;
+
+        bool is_add = (cur->type == CFG_ADD_ROOT || cur->type == CFG_ADD_IGNORE ||
+                       cur->type == CFG_ADD_CMD);
+
+        if (ev.key == KEY_ENTER || (ev.key == KEY_CHAR && ev.ch == ' ')) {
             if (cur->type == CFG_BOOL) {
-                bool *p = cfg_bool_ptr(config, cur->bool_field);
+                bool *p = cfg_bool_ptr(config, cur->field);
                 if (p) {
                     *p = !*p;
                     dirty = true;
                     snprintf(status, sizeof(status), "%s = %s", cur->label, *p ? "true" : "false");
                 }
-            } else if (cur->type == CFG_ADD_ROOT || cur->type == CFG_ADD_CMD ||
-                       cur->type == CFG_INT || cur->type == CFG_DOUBLE) {
+            } else if (is_add || cur->type == CFG_INT || cur->type == CFG_DOUBLE) {
                 mode = CFG_MODE_INPUT;
                 input_kind = cur->type;
+                input_field = cur->field;
                 ilen = 0;
                 input[0] = '\0';
                 if (cur->type == CFG_INT) {
-                    ilen = (size_t)snprintf(input, sizeof(input), "%d", config->max_depth);
+                    int *p = cfg_int_ptr(config, cur->field);
+                    if (p) ilen = (size_t)snprintf(input, sizeof(input), "%d", *p);
                 } else if (cur->type == CFG_DOUBLE) {
                     ilen = (size_t)snprintf(input, sizeof(input), "%.2f", config->frecency_threshold);
                 }
             }
-        } else if (ev.key == KEY_CHAR && ev.ch == 'a') {
+            continue;
+        }
+
+        if (ev.key == KEY_CHAR && ev.ch == 'a') {
             mode = CFG_MODE_INPUT;
-            input_kind = (cur->type == CFG_CMD || cur->type == CFG_ADD_CMD) ? CFG_ADD_CMD : CFG_ADD_ROOT;
+            input_kind = (cur->type == CFG_CMD || cur->type == CFG_ADD_CMD)       ? CFG_ADD_CMD
+                       : (cur->type == CFG_IGNORE || cur->type == CFG_ADD_IGNORE) ? CFG_ADD_IGNORE
+                       : CFG_ADD_ROOT;
             ilen = 0;
             input[0] = '\0';
-        } else if ((ev.key == KEY_BACKSPACE || (ev.key == KEY_CHAR && (ev.ch == 'd' || ev.ch == 'D' || ev.ch == 'x')))
-                   && (cur->type == CFG_ROOT || cur->type == CFG_CMD)) {
-            if (cur->type == CFG_ROOT) {
-                snprintf(status, sizeof(status), "removed root %s", cur->label);
-                config_remove_root_at(config, cur->index);
-            } else {
-                snprintf(status, sizeof(status), "removed command %s", cur->label);
-                config_remove_confirm_command_at(config, cur->index);
-            }
+            continue;
+        }
+
+        if ((ev.key == KEY_BACKSPACE || ev.key == KEY_DELETE ||
+             (ev.key == KEY_CHAR && (ev.ch == 'd' || ev.ch == 'D' || ev.ch == 'x'))) &&
+            cfg_is_list_entry(cur->type)) {
+            // Copy the label before removing it: `cur->label` points straight
+            // into the array being mutated.
+            // Sized to what the status line can show, so the compiler can
+            // see the copy below cannot truncate.
+            char removed[200];
+            snprintf(removed, sizeof(removed), "%s", cur->label);
+            if (cur->type == CFG_ROOT)        config_remove_root_at(config, cur->index);
+            else if (cur->type == CFG_IGNORE) config_remove_ignore_at(config, cur->index);
+            else                              config_remove_confirm_command_at(config, cur->index);
+            snprintf(status, sizeof(status), "removed %s", removed);
             dirty = true;
-            cfg_skip(items, item_count, &selected, -1);
-        } else if (cur->type == CFG_INT && (ev.key == KEY_LEFT || ev.key == KEY_RIGHT ||
-                   (ev.key == KEY_CHAR && (ev.ch == '-' || ev.ch == '+')))) {
-            int delta = (ev.key == KEY_LEFT || ev.ch == '-') ? -1 : 1;
-            int v = config->max_depth + delta;
-            if (v < 1) v = 1;
-            if (v > 32) v = 32;
-            if (v != config->max_depth) {
-                config->max_depth = v;
+            if (selected > 0) selected--;
+            continue;
+        }
+
+        bool dec = (ev.key == KEY_LEFT) || (ev.key == KEY_CHAR && ev.ch == '-');
+        bool inc = (ev.key == KEY_RIGHT) || (ev.key == KEY_CHAR && ev.ch == '+');
+        if (!dec && !inc) continue;
+
+        if (cur->type == CFG_BOOL) {
+            bool *p = cfg_bool_ptr(config, cur->field);
+            if (p) {
+                *p = inc;
                 dirty = true;
-                snprintf(status, sizeof(status), "max_depth = %d", v);
+                snprintf(status, sizeof(status), "%s = %s", cur->label, *p ? "true" : "false");
             }
-        } else if (cur->type == CFG_DOUBLE && (ev.key == KEY_LEFT || ev.key == KEY_RIGHT ||
-                   (ev.key == KEY_CHAR && (ev.ch == '-' || ev.ch == '+')))) {
-            double delta = (ev.key == KEY_LEFT || ev.ch == '-') ? -0.25 : 0.25;
-            double v = config->frecency_threshold + delta;
+        } else if (cur->type == CFG_INT) {
+            int *p = cfg_int_ptr(config, cur->field);
+            int lo, hi, step;
+            cfg_int_range(cur->field, &lo, &hi, &step);
+            if (p) {
+                int v = *p + (inc ? step : -step);
+                if (v < lo) v = lo;
+                if (v > hi) v = hi;
+                if (v != *p) {
+                    *p = v;
+                    dirty = true;
+                    snprintf(status, sizeof(status), "%s = %d", cur->label, v);
+                }
+            }
+        } else if (cur->type == CFG_DOUBLE) {
+            double v = config->frecency_threshold + (inc ? 0.25 : -0.25);
             if (v < 0.25) v = 0.25;
             if (v != config->frecency_threshold) {
                 config->frecency_threshold = v;
                 dirty = true;
                 snprintf(status, sizeof(status), "frecency_threshold = %.2f", v);
             }
-        } else if (cur->type == CFG_BOOL && (ev.key == KEY_LEFT || ev.key == KEY_RIGHT)) {
-            bool *p = cfg_bool_ptr(config, cur->bool_field);
-            if (p) {
-                *p = !*p;
-                dirty = true;
-                snprintf(status, sizeof(status), "%s = %s", cur->label, *p ? "true" : "false");
-            }
         }
     }
 
+    free(items);
+    buf_free(&buf);
     disable_raw_mode();
     sigaction(SIGINT, &old_sa, NULL);
     sigaction(SIGWINCH, &old_win, NULL);

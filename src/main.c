@@ -33,20 +33,42 @@ static void run_doctor(const Jrun_Config *config, const char *config_path, const
 
     // 3. Database
     printf("[3] Database: %s\n", db_path);
-    if (path_exists(db_path)) {
-        printf("    Status: Found\n");
+    {
         Db_Entry *entries = NULL;
         size_t count = 0;
         if (db_get_all(&entries, &count)) {
+            printf("    Status: OK\n");
             printf("    Tracked directories: %zu\n", count);
             db_free_entries(entries, count);
+        } else {
+            printf("    Status: UNREADABLE\n");
         }
-    } else {
-        printf("    Status: Not created yet (will be created on first add)\n");
     }
 
-    // 4. Search Roots
-    printf("[4] Configured Search Roots (%zu):\n", config->roots_count);
+    // 4. Cached directory index
+    {
+        size_t cached = 0;
+        int64_t built_at = 0;
+        db_cache_stats(&cached, &built_at);
+        char fingerprint[64];
+        config_scan_fingerprint(config, fingerprint, sizeof(fingerprint));
+        bool fresh = db_cache_is_fresh(fingerprint, config->cache_ttl);
+
+        printf("[4] Directory index: %zu paths cached\n", cached);
+        if (config->cache_ttl <= 0) {
+            printf("    Status: disabled (cache_ttl = 0, every lookup rescans)\n");
+        } else if (built_at > 0) {
+            long long age = (long long)time(NULL) - (long long)built_at;
+            printf("    Status: %s (%llds old, ttl %ds)\n",
+                   fresh ? "fresh" : "stale, will rebuild on next lookup",
+                   age, config->cache_ttl);
+        } else {
+            printf("    Status: not built yet (run `jrun reindex`)\n");
+        }
+    }
+
+    // 5. Search Roots
+    printf("[5] Configured Search Roots (%zu):\n", config->roots_count);
     for (size_t i = 0; i < config->roots_count; ++i) {
         char expanded[PATH_MAX];
         memset(expanded, 0, sizeof(expanded));
@@ -58,10 +80,12 @@ static void run_doctor(const Jrun_Config *config, const char *config_path, const
         }
     }
 
-    // 5. Terminal & Environment
-    printf("[5] Terminal & Environment:\n");
+    // 6. Terminal & Environment
+    printf("[6] Terminal & Environment:\n");
     printf("    isatty(STDIN):  %s\n", isatty(STDIN_FILENO) ? "yes" : "no");
     printf("    isatty(STDOUT): %s\n", isatty(STDOUT_FILENO) ? "yes" : "no");
+    printf("    interactive UI: %s\n",
+           tui_available() ? "available" : "unavailable (no controlling terminal)");
     const char *term = getenv("TERM");
     printf("    TERM:           %s\n", term ? term : "unset");
     const char *shell = getenv("SHELL");
@@ -120,7 +144,7 @@ int main(int argc, char **argv)
 
     if (args.action == CLI_ACTION_CONFIG_EDIT) {
         int cfg_rc = 0;
-        if (isatty(STDIN_FILENO) && isatty(STDOUT_FILENO)) {
+        if (tui_available()) {
             if (!tui_edit_config(&config, config_path)) {
                 cfg_rc = 1;
             }
@@ -258,6 +282,17 @@ int main(int argc, char **argv)
         break;
     }
 
+    case CLI_ACTION_REINDEX: {
+        size_t indexed = 0;
+        if (resolver_reindex(&config, &indexed)) {
+            jrun_log_info("indexed %zu directories", indexed);
+        } else {
+            jrun_log_error("failed to rebuild the directory index");
+            ret_code = 1;
+        }
+        break;
+    }
+
     case CLI_ACTION_PRUNE: {
         size_t pruned = 0;
         if (db_prune(&pruned)) {
@@ -320,40 +355,39 @@ int main(int argc, char **argv)
 
         char *selected_path = NULL;
 
-        // Disambiguate if ambiguous (and config.interactive is true) or -i flag passed
-        bool need_tui = (args.interactive || (config.interactive && res.status == RESOLVE_AMBIGUOUS));
-        if (need_tui && isatty(STDIN_FILENO) && isatty(STDOUT_FILENO)) {
+        // The selector is gated on a reachable controlling terminal, not on
+        // isatty(stdout): the shell wrapper always runs jrun inside $(...), so
+        // stdout is a pipe even when the user is sitting at a terminal.
+        bool want_tui = args.interactive ||
+                        (config.interactive && res.status == RESOLVE_AMBIGUOUS);
+        if (want_tui && tui_available()) {
             selected_path = tui_select(res.candidates, res.count, args.target);
             if (!selected_path) {
-                // User cancelled TUI
                 resolver_free_result(&res);
-                ret_code = 130;
+                ret_code = 130;  // cancelled
                 break;
             }
         } else {
-            // Pick top candidate
-            selected_path = strdup(res.candidates[0].path);
+            if (want_tui) {
+                jrun_log_debug("%zu candidates but no terminal; taking the top match",
+                               res.count);
+            }
+            selected_path = jrun_strdup(res.candidates[0].path);
+            if (!selected_path) {
+                resolver_free_result(&res);
+                ret_code = 1;
+                break;
+            }
         }
 
-        // Record directory access in database
-        db_add_or_update(selected_path);
-        db_age_if_needed();
-
         if (args.action == CLI_ACTION_CD) {
-            // Directory jump mode: output resolved path
+            db_add_or_update(selected_path);
+            db_age_if_needed();
             printf("%s\n", selected_path);
             ret_code = 0;
         } else {
-            // Echo the target path before running the command
-            if (!args.quiet) {
-                if (isatty(STDOUT_FILENO)) {
-                    printf("%s\n", selected_path);
-                    fflush(stdout);
-                } else {
-                    fprintf(stderr, "%s\n", selected_path);
-                    fflush(stderr);
-                }
-            }
+            // Confirm before anything else happens, so declining a destructive
+            // command leaves no trace: no frecency bump, no echoed path.
             if (!args.yes && config_needs_confirm(&config, args.cmd_argv[0])) {
                 if (!tui_confirm_command(selected_path, args.cmd_argv)) {
                     jrun_log_info("cancelled");
@@ -362,6 +396,17 @@ int main(int argc, char **argv)
                     ret_code = 130;
                     break;
                 }
+            }
+
+            db_add_or_update(selected_path);
+            db_age_if_needed();
+
+            if (!args.quiet) {
+                // stdout belongs to the command we are about to run, so the
+                // directory banner goes to stderr unless nobody is piping us.
+                FILE *banner = isatty(STDOUT_FILENO) ? stdout : stderr;
+                fprintf(banner, "%s\n", selected_path);
+                fflush(banner);
             }
             ret_code = executor_run(selected_path, args.cmd_argv);
         }
