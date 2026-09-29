@@ -91,9 +91,9 @@ jobs:
 
       - name: Check the snippets actually load
         run: |
-          bash -lc 'eval "$(./build/jrun --init bash)"; type j'
-          zsh  -c  'eval "$(./build/jrun --init zsh)";  type j'
-          fish -c  './build/jrun --init fish | source; type j'
+          bash -lc 'eval "$(./build/jrun --init bash)"; type j; type jrun | grep -q function'
+          zsh  -c  'eval "$(./build/jrun --init zsh)";  type j; type jrun | grep -q function'
+          fish -c  './build/jrun --init fish | source; type j; type jrun | grep -q function'
 
       - name: Check tab completion is registered
         run: |

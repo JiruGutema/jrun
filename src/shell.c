@@ -65,9 +65,10 @@ static const char *ZSH_HOOK =
 "    chpwd_functions+=(\"__jrun_track\")\n"
 "fi\n";
 
-// Only `j` is defined. Shadowing `jrun` itself with a function was surprising:
-// it silently changed what `jrun <target>` did compared to running the binary,
-// and made the documented "print the resolved path" behaviour unreachable.
+// A program cannot change its parent shell's directory, so jumping has to
+// happen in a shell function. Both `j` and `jrun` are defined, so that
+// `jrun <target>` jumps in an interactive shell as it always has; the binary's
+// print-the-path behaviour is still there as `command jrun <target>`.
 static const char *COMMON_POSIX_WRAPPER =
 "\n"
 "# j <target>           cd to the best match\n"
@@ -138,6 +139,10 @@ static const char *COMMON_POSIX_WRAPPER =
 "\n"
 "    # Two or more arguments: target plus a command to run there.\n"
 "    command jrun \"$@\"\n"
+"}\n"
+"\n"
+"jrun() {\n"
+"    j \"$@\"\n"
 "}\n";
 
 // Tab completion. Kept apart from the wrapper because bash and zsh drive
@@ -521,6 +526,10 @@ static const char *FISH_INIT =
 "    end\n"
 "\n"
 "    command jrun $argv\n"
+"end\n"
+"\n"
+"function jrun --description 'jump to or run a command in a project directory'\n"
+"    j $argv\n"
 "end\n";
 
 static const char *FISH_COMPLETION =

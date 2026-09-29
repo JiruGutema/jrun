@@ -164,8 +164,10 @@ j                   # cd to $HOME
 j hypr nvim         # run a command there
 ```
 
-`jrun` itself is left alone — it stays the binary, so `jrun <target>` still prints a path
-rather than changing directory. Only `j` is a shell function.
+`jrun` is defined as a shell function too, so `jrun <target>` changes directory exactly like
+`j <target>`. A program can't change its parent shell's directory, so without the shell
+integration `jrun <target>` only prints the path. To get the path from an integrated shell,
+use `command jrun <target>`.
 
 ### Tab completion
 
