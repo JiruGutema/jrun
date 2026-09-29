@@ -167,6 +167,28 @@ j hypr nvim         # run a command there
 `jrun` itself is left alone — it stays the binary, so `jrun <target>` still prints a path
 rather than changing directory. Only `j` is a shell function.
 
+### Tab completion
+
+The init script also sets up tab completion for both `jrun` and `j`:
+
+```bash
+jrun pol<Tab>                 # directory names jrun knows: polif  polishing
+jrun polif git l<Tab>         # git's own completion, run inside polif: log
+jrun polif git checkout <Tab> # polif's branches, not the current repo's
+jrun ~ nvim .bash<Tab>        # files in ~: .bash_history  .bash_profile  .bashrc
+```
+
+The first word completes to matching directory names (fuzzy matches are offered when nothing
+starts with what you typed). Everything after it is handed to that command's normal completion,
+run from inside the directory the target resolves to. Pressing Tab never opens the selector
+and never counts as a visit. When a target is ambiguous, completion uses the top match.
+
+- **Bash**: uses [bash-completion](https://github.com/scop/bash-completion) for per-command
+  completion when it is installed, and falls back to plain command and file-name completion
+  otherwise.
+- **Zsh**: needs the completion system loaded, so put the `eval` line **after** `compinit` in
+  `~/.zshrc`.
+
 ---
 
 ## CLI Options & Commands

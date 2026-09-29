@@ -94,3 +94,9 @@ jobs:
           bash -lc 'eval "$(./build/jrun --init bash)"; type j'
           zsh  -c  'eval "$(./build/jrun --init zsh)";  type j'
           fish -c  './build/jrun --init fish | source; type j'
+
+      - name: Check tab completion is registered
+        run: |
+          bash -c 'eval "$(./build/jrun --init bash)"; complete -p jrun j'
+          zsh  -c 'autoload -Uz compinit && compinit -u; eval "$(./build/jrun --init zsh)"; (( $+_comps[jrun] && $+_comps[j] ))'
+          fish -c './build/jrun --init fish | source; complete -c jrun | string match -q "*__jrun_complete*"'
