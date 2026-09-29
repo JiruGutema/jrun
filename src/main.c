@@ -16,6 +16,9 @@
 
 Log_Level g_log_level = LOG_LEVEL_NORMAL;
 
+// More than this scrolls off the screen when the shell lists them.
+#define COMPLETION_LIMIT 50
+
 static void run_doctor(const Jrun_Config *config, const char *config_path, const char *db_path)
 {
     printf("=== Jrun Doctor Diagnostics ===\n\n");
@@ -329,6 +332,38 @@ int main(int argc, char **argv)
                    res.candidates[i].frecency,
                    short_path,
                    res.candidates[i].from_db ? "(db)" : "(root)");
+        }
+        resolver_free_result(&res);
+        break;
+    }
+
+    case CLI_ACTION_COMPLETE_TARGET: {
+        char **names = NULL;
+        size_t count = 0;
+        if (resolver_complete(args.target, &config, COMPLETION_LIMIT, &names, &count)) {
+            for (size_t i = 0; i < count; ++i) {
+                printf("%s\n", names[i]);
+            }
+            resolver_free_names(names, count);
+        } else {
+            ret_code = 1;
+        }
+        break;
+    }
+
+    case CLI_ACTION_RESOLVE: {
+        // Completion needs to know where a command would run. Pressing Tab
+        // must never open the selector or count as a visit, so this takes the
+        // top match as it stands and leaves the database alone.
+        if (!args.target) {
+            ret_code = 1;
+            break;
+        }
+        Resolve_Result res = resolver_resolve(args.target, &config, false);
+        if (res.count > 0) {
+            printf("%s\n", res.candidates[0].path);
+        } else {
+            ret_code = 1;
         }
         resolver_free_result(&res);
         break;

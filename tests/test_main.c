@@ -892,6 +892,67 @@ static bool test_resolver_visiting_never_demotes(void)
     return true;
 }
 
+static bool names_contain(char **names, size_t count, const char *name)
+{
+    for (size_t i = 0; i < count; ++i) {
+        if (strcmp(names[i], name) == 0) return true;
+    }
+    return false;
+}
+
+static bool test_resolver_complete(void)
+{
+    const char *tmp_db = sb("db/complete.sqlite");
+    ASSERT(db_init(tmp_db), "init db for completion test");
+
+    ASSERT(mkdirs(sb("complete/a/polif")), "mk a/polif");
+    ASSERT(mkdirs(sb("complete/b/polif")), "mk b/polif");
+    ASSERT(mkdirs(sb("complete/a/polishing")), "mk polishing");
+    ASSERT(mkdirs(sb("complete/a/api")), "mk api");
+
+    Jrun_Config cfg = {0};
+    config_init_default(&cfg);
+    char root[PATH_MAX];
+    snprintf(root, sizeof(root), "%s", sb("complete"));
+    const char *roots[] = { root };
+    set_roots(&cfg, roots, 1);
+
+    char **names = NULL;
+    size_t count = 0;
+
+    ASSERT(resolver_complete("pol", &cfg, 50, &names, &count), "complete pol");
+    ASSERT(count == 2, "two distinct names, the duplicate polif listed once");
+    ASSERT(names_contain(names, count, "polif"), "polif offered");
+    ASSERT(names_contain(names, count, "polishing"), "polishing offered");
+    resolver_free_names(names, count);
+
+    // Nothing starts with "plf", so the fuzzy matches are offered instead.
+    ASSERT(resolver_complete("plf", &cfg, 50, &names, &count), "complete plf");
+    ASSERT(count >= 1 && strcmp(names[0], "polif") == 0, "fuzzy match falls back to polif");
+    ASSERT(!names_contain(names, count, "api"), "non-matching name left out");
+    resolver_free_names(names, count);
+
+    ASSERT(resolver_complete("pol", &cfg, 1, &names, &count), "complete with a limit");
+    ASSERT(count == 1, "limit is respected");
+    resolver_free_names(names, count);
+
+    ASSERT(resolver_complete("zzzz", &cfg, 50, &names, &count), "complete no match");
+    ASSERT(count == 0 && names == NULL, "no match yields nothing");
+
+    ASSERT(resolver_complete("~/pol", &cfg, 50, &names, &count), "complete a path");
+    ASSERT(count == 0, "paths are left to the shell's directory completion");
+
+    // An empty prefix lists visited directories only.
+    ASSERT(db_add_or_update(sb("complete/a/api")), "record a visit");
+    ASSERT(resolver_complete("", &cfg, 50, &names, &count), "complete empty prefix");
+    ASSERT(count == 1 && strcmp(names[0], "api") == 0, "empty prefix lists the visited directory");
+    resolver_free_names(names, count);
+
+    config_free(&cfg);
+    db_close();
+    return true;
+}
+
 // --- 7. CLI ------------------------------------------------------------------
 
 static bool test_cli_parsing(void)
@@ -1001,6 +1062,33 @@ static bool test_cli_parsing(void)
     }
 
     {
+        char *argv[] = {"jrun", "--complete-target", "pol", NULL};
+        Cli_Args args = {0};
+        ASSERT(cli_parse(3, argv, &args), "parse --complete-target pol");
+        ASSERT(args.action == CLI_ACTION_COMPLETE_TARGET, "complete-target action");
+        ASSERT(strcmp(args.target, "pol") == 0, "prefix is pol");
+        cli_free_args(&args);
+    }
+
+    {
+        char *argv[] = {"jrun", "--complete-target", NULL};
+        Cli_Args args = {0};
+        ASSERT(cli_parse(2, argv, &args), "parse --complete-target with no prefix");
+        ASSERT(args.action == CLI_ACTION_COMPLETE_TARGET, "complete-target action");
+        ASSERT(args.target && args.target[0] == '\0', "missing prefix is empty");
+        cli_free_args(&args);
+    }
+
+    {
+        char *argv[] = {"jrun", "--resolve", "polif", NULL};
+        Cli_Args args = {0};
+        ASSERT(cli_parse(3, argv, &args), "parse --resolve polif");
+        ASSERT(args.action == CLI_ACTION_RESOLVE, "resolve action");
+        ASSERT(strcmp(args.target, "polif") == 0, "target is polif");
+        cli_free_args(&args);
+    }
+
+    {
         char *argv[] = {"jrun", "--bogus", NULL};
         Cli_Args args = {0};
         ASSERT(!cli_parse(2, argv, &args), "unknown option is rejected");
@@ -1086,6 +1174,7 @@ int main(void)
     RUN_TEST(test_resolver_uses_cache);
     RUN_TEST(test_resolver_skips_stale_cache_entries);
     RUN_TEST(test_resolver_visiting_never_demotes);
+    RUN_TEST(test_resolver_complete);
     RUN_TEST(test_cli_parsing);
     RUN_TEST(test_shell_integration);
     RUN_TEST(test_executor);

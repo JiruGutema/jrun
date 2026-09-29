@@ -114,6 +114,20 @@ bool cli_parse(int argc, char **argv, Cli_Args *args)
                 args->extra_arg = dup_str(argv[i++]);
             }
             return true;
+        } else if (strcmp(argv[i], "--complete-target") == 0) {
+            // Called by the shell completion scripts; not listed in --help.
+            args->action = CLI_ACTION_COMPLETE_TARGET;
+            i++;
+            args->target = dup_str(i < argc ? argv[i] : "");
+            return true;
+        } else if (strcmp(argv[i], "--resolve") == 0) {
+            // Called by the shell completion scripts; not listed in --help.
+            args->action = CLI_ACTION_RESOLVE;
+            i++;
+            if (i < argc) {
+                args->target = dup_str(argv[i++]);
+            }
+            return true;
         } else if (strcmp(argv[i], "--init") == 0) {
             args->action = CLI_ACTION_INIT_SHELL;
             i++;

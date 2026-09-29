@@ -414,6 +414,107 @@ Resolve_Result resolver_resolve(const char *target, const Jrun_Config *config, b
     return result;
 }
 
+typedef struct {
+    char **items;
+    size_t count;
+    size_t capacity;
+} Name_List;
+
+static bool name_list_contains(const Name_List *list, const char *name)
+{
+    for (size_t i = 0; i < list->count; ++i) {
+        if (strcmp(list->items[i], name) == 0) return true;
+    }
+    return false;
+}
+
+// Adds the final component of `path` unless it is already listed or the list
+// is full. Returns false only on allocation failure.
+static bool name_list_add_basename(Name_List *list, const char *path, size_t limit)
+{
+    char name[PATH_MAX];
+    path_basename_r(path, name, sizeof(name));
+    if (name[0] == '\0' || strcmp(name, "/") == 0) return true;
+    if (list->count >= limit || name_list_contains(list, name)) return true;
+
+    bool ok = true;
+    JRUN_DA_GROW(list->items, list->count, list->capacity, 16, ok);
+    if (!ok) return false;
+    char *copy = jrun_strdup(name);
+    if (!copy) return false;
+    list->items[list->count++] = copy;
+    return true;
+}
+
+static int compare_entries_by_frecency_desc(const void *a, const void *b)
+{
+    const Db_Entry *ea = (const Db_Entry *)a;
+    const Db_Entry *eb = (const Db_Entry *)b;
+    if (eb->frecency > ea->frecency) return 1;
+    if (eb->frecency < ea->frecency) return -1;
+    return 0;
+}
+
+bool resolver_complete(const char *prefix, const Jrun_Config *config, size_t limit,
+                       char ***out_names, size_t *out_count)
+{
+    if (!out_names || !out_count) return false;
+    *out_names = NULL;
+    *out_count = 0;
+    if (limit == 0) return true;
+    if (!prefix) prefix = "";
+
+    // Paths are completed by the shell's own directory completion.
+    if (target_looks_like_path(prefix)) return true;
+
+    Name_List prefixed = {0};
+    Name_List others = {0};
+    bool ok = true;
+
+    if (prefix[0] == '\0') {
+        Db_Entry *entries = NULL;
+        size_t count = 0;
+        if (db_get_all(&entries, &count)) {
+            qsort(entries, count, sizeof(Db_Entry), compare_entries_by_frecency_desc);
+            for (size_t i = 0; i < count && ok; ++i) {
+                if (!path_is_dir(entries[i].path)) continue;
+                ok = name_list_add_basename(&prefixed, entries[i].path, limit);
+            }
+            db_free_entries(entries, count);
+        }
+    } else {
+        size_t prefix_len = strlen(prefix);
+        Resolve_Result res = resolver_resolve(prefix, config, false);
+        for (size_t i = 0; i < res.count && ok; ++i) {
+            char name[PATH_MAX];
+            path_basename_r(res.candidates[i].path, name, sizeof(name));
+            Name_List *list = strncmp(name, prefix, prefix_len) == 0 ? &prefixed : &others;
+            ok = name_list_add_basename(list, res.candidates[i].path, limit);
+        }
+        resolver_free_result(&res);
+    }
+
+    Name_List *keep = prefixed.count > 0 ? &prefixed : &others;
+    Name_List *drop = keep == &prefixed ? &others : &prefixed;
+    resolver_free_names(drop->items, drop->count);
+    if (!ok) {
+        resolver_free_names(keep->items, keep->count);
+        return false;
+    }
+    *out_names = keep->items;
+    *out_count = keep->count;
+    return true;
+}
+
+void resolver_free_names(char **names, size_t count)
+{
+    if (!names) return;
+    for (size_t i = 0; i < count; ++i) {
+        free(names[i]);
+    }
+    free(names);
+}
+
 void resolver_free_result(Resolve_Result *res)
 {
     if (!res || !res->candidates) return;
