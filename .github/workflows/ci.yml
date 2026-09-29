@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.cc }} ${{ matrix.mode }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+        mode: [release, debug]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev pkg-config
+
+      - name: Build
+        run: make CC=${{ matrix.cc }} ${{ matrix.mode }}
+
+      - name: Test
+        run: make CC=${{ matrix.cc }} test
+
+  sanitizers:
+    name: AddressSanitizer + UBSan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev pkg-config
+
+      # Catches the scanner leak class of bug that a plain test run passes over.
+      - name: Run tests under sanitizers
+        run: make asan
+
+  nob:
+    name: nob build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev
+
+      # The second build system must not be allowed to rot.
+      - name: Build and test with nob
+        run: |
+          cc -o nob nob.c
+          ./nob -test
+
+  shell-syntax:
+    name: Shell integration syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev zsh fish
+
+      - name: Build
+        run: make
+
+      # The generated snippets are eval'd into a user's interactive shell, so a
+      # syntax error there breaks their terminal on next login.
+      - name: Check generated snippets parse
+        run: |
+          ./build/jrun --init bash > /tmp/init.bash
+          ./build/jrun --init zsh  > /tmp/init.zsh
+          ./build/jrun --init fish > /tmp/init.fish
+          bash -n /tmp/init.bash
+          zsh  -n /tmp/init.zsh
+          fish --no-execute /tmp/init.fish
+
+      - name: Check the snippets actually load
+        run: |
+          bash -lc 'eval "$(./build/jrun --init bash)"; type j'
+          zsh  -c  'eval "$(./build/jrun --init zsh)";  type j'
+          fish -c  './build/jrun --init fish | source; type j'
