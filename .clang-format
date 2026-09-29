@@ -1,0 +1,20 @@
+# Matches the style already present in src/: 4-space indent, 100 columns,
+# Allman braces for functions and K&R for everything else.
+---
+Language: Cpp
+BasedOnStyle: LLVM
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 100
+BreakBeforeBraces: Linux
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLoopsOnASingleLine: false
+AllowShortCaseLabelsOnASingleLine: true
+AlignAfterOpenBracket: Align
+AlignConsecutiveMacros: false
+PointerAlignment: Right
+SpaceAfterCStyleCast: false
+SortIncludes: false
+IndentCaseLabels: false
