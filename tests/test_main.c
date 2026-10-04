@@ -1095,6 +1095,61 @@ static bool test_cli_parsing(void)
         cli_free_args(&args);
     }
 
+    {
+        char *argv[] = {"jrun", "hypr", "-i", NULL};
+        Cli_Args args = {0};
+        ASSERT(cli_parse(3, argv, &args), "parse jrun hypr -i");
+        ASSERT(args.action == CLI_ACTION_CD, "trailing flag is not a command");
+        ASSERT(args.interactive == true, "trailing -i sets interactive");
+        ASSERT(strcmp(args.target, "hypr") == 0, "target is hypr");
+        cli_free_args(&args);
+    }
+
+    {
+        char *argv[] = {"jrun", "hypr", "-y", "--debug", "rm", "-rf", "build", NULL};
+        Cli_Args args = {0};
+        ASSERT(cli_parse(7, argv, &args), "parse flags between target and command");
+        ASSERT(args.yes && args.debug, "flags after target are applied");
+        ASSERT(args.action == CLI_ACTION_EXECUTE, "execute action");
+        ASSERT(args.cmd_argc == 3, "command keeps its own flags");
+        ASSERT(strcmp(args.cmd_argv[1], "-rf") == 0, "command's -rf untouched");
+        ASSERT(!args.interactive, "command's flags are not jrun's");
+        cli_free_args(&args);
+    }
+
+    {
+        char *argv[] = {"jrun", "hypr", "--", "-i", NULL};
+        Cli_Args args = {0};
+        ASSERT(cli_parse(4, argv, &args), "parse jrun hypr -- -i");
+        ASSERT(!args.interactive, "-- stops flag parsing");
+        ASSERT(args.action == CLI_ACTION_EXECUTE, "-i after -- is the command");
+        cli_free_args(&args);
+    }
+
+    {
+        char *argv[] = {"jrun", "--cd", "hypr", "-i", NULL};
+        Cli_Args args = {0};
+        ASSERT(cli_parse(4, argv, &args), "parse jrun --cd hypr -i");
+        ASSERT(args.action == CLI_ACTION_CD, "cd action");
+        ASSERT(args.interactive, "--cd accepts trailing -i");
+        cli_free_args(&args);
+    }
+
+    {
+        char *argv[] = {"jrun", "cd", "hypr", "-i", NULL};
+        Cli_Args args = {0};
+        ASSERT(cli_parse(4, argv, &args), "parse jrun cd hypr -i");
+        ASSERT(args.interactive, "cd subcommand accepts trailing -i");
+        cli_free_args(&args);
+    }
+
+    {
+        char *argv[] = {"jrun", "hypr", "--bogus", NULL};
+        Cli_Args args = {0};
+        ASSERT(!cli_parse(3, argv, &args), "unknown option after target is rejected");
+        cli_free_args(&args);
+    }
+
     return true;
 }
 

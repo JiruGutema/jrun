@@ -66,6 +66,40 @@ void cli_free_args(Cli_Args *args)
     memset(args, 0, sizeof(*args));
 }
 
+// Flags that only modify how a target is resolved. They are accepted before
+// the target and directly after it, so `jrun proj -i` works like `jrun -i proj`.
+static bool parse_modifier_flag(const char *arg, Cli_Args *args)
+{
+    if (strcmp(arg, "-d") == 0 || strcmp(arg, "--debug") == 0) {
+        args->debug = true;
+    } else if (strcmp(arg, "-q") == 0 || strcmp(arg, "--quiet") == 0) {
+        args->quiet = true;
+    } else if (strcmp(arg, "-i") == 0 || strcmp(arg, "--interactive") == 0) {
+        args->interactive = true;
+    } else if (strcmp(arg, "-y") == 0 || strcmp(arg, "--yes") == 0) {
+        args->yes = true;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+// Consumes modifier flags following a target. Stops at "--" or the first
+// argument that is not an option, which is where the command begins; no
+// command starts with '-', so this never swallows part of one.
+static bool parse_trailing_flags(int argc, char **argv, int *i, Cli_Args *args)
+{
+    while (*i < argc && argv[*i][0] == '-' && argv[*i][1] != '\0' &&
+           strcmp(argv[*i], "--") != 0) {
+        if (!parse_modifier_flag(argv[*i], args)) {
+            jrun_log_error("unknown option '%s'", argv[*i]);
+            return false;
+        }
+        (*i)++;
+    }
+    return true;
+}
+
 bool cli_parse(int argc, char **argv, Cli_Args *args)
 {
     if (!args) return false;
@@ -88,17 +122,7 @@ bool cli_parse(int argc, char **argv, Cli_Args *args)
         } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) {
             args->action = CLI_ACTION_VERSION;
             return true;
-        } else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--debug") == 0) {
-            args->debug = true;
-            i++;
-        } else if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) {
-            args->quiet = true;
-            i++;
-        } else if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--interactive") == 0) {
-            args->interactive = true;
-            i++;
-        } else if (strcmp(argv[i], "-y") == 0 || strcmp(argv[i], "--yes") == 0) {
-            args->yes = true;
+        } else if (parse_modifier_flag(argv[i], args)) {
             i++;
         } else if (strcmp(argv[i], "--cd") == 0) {
             args->action = CLI_ACTION_CD;
@@ -106,7 +130,7 @@ bool cli_parse(int argc, char **argv, Cli_Args *args)
             if (i < argc) {
                 args->target = dup_str(argv[i++]);
             }
-            return true;
+            return parse_trailing_flags(argc, argv, &i, args);
         } else if (strcmp(argv[i], "--add") == 0) {
             args->action = CLI_ACTION_ADD;
             i++;
@@ -234,13 +258,15 @@ bool cli_parse(int argc, char **argv, Cli_Args *args)
         args->action = CLI_ACTION_CD;
         i++;
         if (i < argc) {
-            args->target = dup_str(argv[i]);
+            args->target = dup_str(argv[i++]);
         }
-        return true;
+        return parse_trailing_flags(argc, argv, &i, args);
     }
 
     // Otherwise, first argument is the target
     args->target = dup_str(argv[i++]);
+
+    if (!parse_trailing_flags(argc, argv, &i, args)) return false;
 
     // Check if next argument is "--"
     if (i < argc && strcmp(argv[i], "--") == 0) {

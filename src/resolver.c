@@ -295,12 +295,11 @@ Resolve_Result resolver_resolve(const char *target, const Jrun_Config *config, b
     size_t db_count = 0;
     if (db_get_all(&db_entries, &db_count)) {
         for (size_t i = 0; i < db_count; ++i) {
-            if (!path_is_dir(db_entries[i].path)) {
-                continue;
-            }
-
             Match_Result match = matcher_evaluate_opts(target, db_entries[i].path, enable_fuzzy);
             if (!match.is_match) continue;
+
+            // Matching is in-memory; only pay for a stat() on paths that match.
+            if (!path_is_dir(db_entries[i].path)) continue;
 
             ssize_t existing_idx = path_set_find(&candidate_set, db_entries[i].path);
             if (existing_idx >= 0) {
