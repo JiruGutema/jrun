@@ -8,6 +8,7 @@
 #include "cli.h"
 #include "shell.h"
 #include "executor.h"
+#include "session.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -209,6 +210,36 @@ static bool test_project_detection(void)
     return true;
 }
 
+static bool test_project_root(void)
+{
+    ASSERT(mkdirs(sb("pr/repo/.git")), "make repo");
+    ASSERT(mkdirs(sb("pr/repo/src/deep")), "make repo/src/deep");
+    ASSERT(touch(sb("pr/repo/src/Makefile")), "Makefile inside the repo");
+    ASSERT(mkdirs(sb("pr/repo/vendor/lib/.git")), "nested repo");
+    ASSERT(mkdirs(sb("pr/loose/pkg/sub")), "make a project without a repository");
+    ASSERT(touch(sb("pr/loose/pkg/package.json")), "package.json");
+    ASSERT(mkdirs(sb("pr/nothing")), "make a directory in no project");
+
+    char root[PATH_MAX];
+    ASSERT(resolver_project_root(sb("pr/repo/src/deep"), root, sizeof(root)), "root from deep inside");
+    ASSERT(strcmp(root, sb("pr/repo")) == 0, "a Makefile in src/ does not stop the climb");
+
+    ASSERT(resolver_project_root(sb("pr/repo/vendor/lib"), root, sizeof(root)), "root from nested repo");
+    ASSERT(strcmp(root, sb("pr/repo")) == 0, "at a repository root, @ climbs to the enclosing one");
+
+    ASSERT(resolver_project_root(sb("pr/repo"), root, sizeof(root)), "root from the outermost root");
+    ASSERT(strcmp(root, sb("pr/repo")) == 0, "the outermost root stays put");
+
+    ASSERT(resolver_project_root(sb("pr/loose/pkg/sub"), root, sizeof(root)), "root without a repository");
+    ASSERT(strcmp(root, sb("pr/loose/pkg")) == 0, "nearest marker when there is no repository");
+
+    ASSERT(!resolver_project_root(sb("pr/nothing"), root, sizeof(root)), "no project, no root");
+
+    ASSERT(resolver_is_project_target("@") && resolver_is_project_target("@/src"), "@ targets");
+    ASSERT(!resolver_is_project_target("@foo") && !resolver_is_project_target("a@"), "not @ targets");
+    return true;
+}
+
 // --- 2. matcher --------------------------------------------------------------
 
 static bool test_matcher(void)
@@ -250,6 +281,25 @@ static bool test_matcher(void)
 
     Match_Result m_multi = matcher_evaluate("dev/jrun", "/home/user/development/jrun");
     ASSERT(m_multi.is_match, "multi-component prefix match");
+
+    // The last part names the directory itself, not any directory inside it.
+    ASSERT(!matcher_evaluate("dev/jrun", "/home/user/development/jrun/src").is_match,
+           "a path part does not match the directories below it");
+    ASSERT(matcher_evaluate("dev/const", "/home/user/development/Mereb/constituent").is_match,
+           "earlier parts may skip directories in between");
+    ASSERT(!matcher_evaluate("const/dev", "/home/user/development/constituent").is_match,
+           "parts match in order");
+    Match_Result m_close = matcher_evaluate("development/constituent", "/x/development/constituent");
+    Match_Result m_loose = matcher_evaluate("dv/cnst", "/x/development/constituent");
+    ASSERT(m_close.is_match && m_loose.is_match, "both spellings match");
+    ASSERT(m_close.quality_score > m_loose.quality_score, "closer parts rank higher");
+
+    // Components of $HOME itself are not something a user means to match.
+    char under_home[PATH_MAX];
+    snprintf(under_home, sizeof(under_home), "%s/work/api", getenv("HOME"));
+    ASSERT(!matcher_evaluate("tmp/api", under_home).is_match,
+           "path parts ignore the components of $HOME");
+    ASSERT(matcher_evaluate("work/api", under_home).is_match, "parts below $HOME still match");
 
     // An over-long multi-component target must be refused, not silently
     // truncated into a different query that then "matches".
@@ -1153,6 +1203,133 @@ static bool test_cli_parsing(void)
     return true;
 }
 
+static bool test_cli_new_flags(void)
+{
+    {
+        char *argv[] = {"jrun", "-a", "constituent", "git", "status", NULL};
+        Cli_Args args = {0};
+        ASSERT(cli_parse(5, argv, &args), "parse -a");
+        ASSERT(args.all && args.action == CLI_ACTION_EXECUTE, "-a with a command");
+        ASSERT(args.cmd_argc == 2, "command is git status");
+        cli_free_args(&args);
+    }
+    {
+        char *argv[] = {"jrun", "proj", "-m", "make", NULL};
+        Cli_Args args = {0};
+        ASSERT(cli_parse(4, argv, &args), "parse trailing -m");
+        ASSERT(args.multi && args.action == CLI_ACTION_EXECUTE, "-m after the target");
+        cli_free_args(&args);
+    }
+    {
+        char *argv[] = {"jrun", "proj", "ls", "-a", NULL};
+        Cli_Args args = {0};
+        ASSERT(cli_parse(4, argv, &args), "parse ls -a");
+        ASSERT(!args.all && args.cmd_argc == 2, "-a after the command belongs to it");
+        cli_free_args(&args);
+    }
+    {
+        char *argv[] = {"jrun", "api", "--session", NULL};
+        Cli_Args args = {0};
+        ASSERT(cli_parse(3, argv, &args), "parse --session");
+        ASSERT(args.session && args.action == CLI_ACTION_CD, "session is a jump");
+        cli_free_args(&args);
+    }
+    {
+        char *argv[] = {"jrun", "mark", NULL};
+        Cli_Args args = {0};
+        ASSERT(cli_parse(2, argv, &args), "parse mark");
+        ASSERT(args.action == CLI_ACTION_MARK_LIST, "bare mark lists");
+        cli_free_args(&args);
+    }
+    {
+        char *argv[] = {"jrun", "mark", "api", "/srv/api", NULL};
+        Cli_Args args = {0};
+        ASSERT(cli_parse(4, argv, &args), "parse mark api /srv/api");
+        ASSERT(args.action == CLI_ACTION_MARK_ADD, "mark with a name adds");
+        ASSERT(strcmp(args.target, "api") == 0 && strcmp(args.extra_arg, "/srv/api") == 0,
+               "name and path");
+        cli_free_args(&args);
+    }
+    {
+        char *argv[] = {"jrun", "unmark", "api", NULL};
+        Cli_Args args = {0};
+        ASSERT(cli_parse(3, argv, &args), "parse unmark");
+        ASSERT(args.action == CLI_ACTION_MARK_REMOVE && strcmp(args.target, "api") == 0, "unmark api");
+        cli_free_args(&args);
+    }
+    ASSERT(cli_is_reserved_word("list") && cli_is_reserved_word("mark"), "subcommands are reserved");
+    ASSERT(!cli_is_reserved_word("api"), "ordinary names are not");
+    return true;
+}
+
+static bool test_bookmarks(void)
+{
+    ASSERT(db_init(sb("db/marks.sqlite")), "init db for bookmarks");
+    ASSERT(mkdirs(sb("marks/deep/place/api/src")), "make the bookmarked tree");
+    ASSERT(mkdirs(sb("marks/other/api")), "make another api");
+    ASSERT(mkdirs(sb("marks/apiary")), "make a directory sharing the prefix");
+
+    ASSERT(db_bookmark_set("api", sb("marks/deep/place/api")), "set bookmark");
+    ASSERT(!db_bookmark_set("bad", sb("marks/no/such/dir")), "a missing directory is refused");
+
+    char *path = NULL;
+    ASSERT(db_bookmark_get("api", &path) && path, "get bookmark");
+    ASSERT(strcmp(path, sb("marks/deep/place/api")) == 0, "stored path");
+    free(path);
+    ASSERT(db_bookmark_get("nope", &path) && path == NULL, "unknown bookmark is NULL");
+
+    ASSERT(db_bookmark_set("api", sb("marks/other/api")), "repoint bookmark");
+    ASSERT(db_bookmark_get("api", &path) && strcmp(path, sb("marks/other/api")) == 0, "repointed");
+    free(path);
+    ASSERT(db_bookmark_set("api", sb("marks/deep/place/api")), "point it back");
+
+    Jrun_Config cfg = {0};
+    config_init_default(&cfg);
+    char root[PATH_MAX];
+    snprintf(root, sizeof(root), "%s", sb("marks"));
+    const char *roots[] = { root };
+    set_roots(&cfg, roots, 1);
+
+    // Two directories are named api, but the bookmark settles it.
+    Resolve_Result res = resolver_resolve("api", &cfg, true);
+    ASSERT(res.status == RESOLVE_SINGLE_MATCH && res.count == 1, "bookmark is a single match");
+    ASSERT(res.candidates[0].is_bookmark, "flagged as a bookmark");
+    ASSERT(strcmp(res.candidates[0].path, sb("marks/deep/place/api")) == 0, "bookmark wins");
+    resolver_free_result(&res);
+
+    res = resolver_resolve("api/src", &cfg, true);
+    ASSERT(res.count == 1 && strcmp(res.candidates[0].path, sb("marks/deep/place/api/src")) == 0,
+           "bookmark/sub resolves below the bookmark");
+    resolver_free_result(&res);
+
+    // Completion lists the bookmark, and still offers other names it prefixes.
+    char **names = NULL;
+    size_t count = 0;
+    ASSERT(resolver_complete("api", &cfg, 50, &names, &count), "complete api");
+    ASSERT(count >= 2 && strcmp(names[0], "api") == 0, "bookmark first");
+    ASSERT(names_contain(names, count, "apiary"), "a bookmark does not hide other names");
+    resolver_free_names(names, count);
+
+    Db_Bookmark *marks = NULL;
+    size_t mark_count = 0;
+    ASSERT(db_bookmark_list(&marks, &mark_count) && mark_count == 1, "one bookmark listed");
+    db_free_bookmarks(marks, mark_count);
+
+    bool removed = false;
+    ASSERT(db_bookmark_remove("api", &removed) && removed, "remove bookmark");
+    ASSERT(db_bookmark_remove("api", &removed) && !removed, "removing again reports nothing removed");
+
+    res = resolver_resolve("api", &cfg, true);
+    ASSERT(res.count >= 2 && res.candidates[0].is_exact_basename &&
+           res.candidates[1].is_exact_basename && !res.candidates[0].is_bookmark,
+           "without the bookmark both api directories match again");
+    resolver_free_result(&res);
+
+    config_free(&cfg);
+    db_close();
+    return true;
+}
+
 // --- 8. shell ----------------------------------------------------------------
 
 static bool test_shell_integration(void)
@@ -1162,6 +1339,12 @@ static bool test_shell_integration(void)
     ASSERT(shell_parse_type("fish") == SHELL_FISH, "fish type");
     ASSERT(shell_parse_type("invalid") == SHELL_UNKNOWN, "unknown type");
     ASSERT(shell_parse_type(NULL) == SHELL_UNKNOWN, "NULL type");
+
+    char name[64];
+    session_name_from_dir("/home/u/my.app", name, sizeof(name));
+    ASSERT(strcmp(name, "my_app") == 0, "tmux session names avoid '.'");
+    session_name_from_dir("/", name, sizeof(name));
+    ASSERT(strcmp(name, "root") == 0, "/ gets a usable session name");
     return true;
 }
 
@@ -1212,6 +1395,7 @@ int main(void)
     RUN_TEST(test_path_utils);
     RUN_TEST(test_path_atomic_write);
     RUN_TEST(test_project_detection);
+    RUN_TEST(test_project_root);
     RUN_TEST(test_matcher);
     RUN_TEST(test_matcher_highlight);
     RUN_TEST(test_config);
@@ -1231,6 +1415,8 @@ int main(void)
     RUN_TEST(test_resolver_visiting_never_demotes);
     RUN_TEST(test_resolver_complete);
     RUN_TEST(test_cli_parsing);
+    RUN_TEST(test_cli_new_flags);
+    RUN_TEST(test_bookmarks);
     RUN_TEST(test_shell_integration);
     RUN_TEST(test_executor);
 

@@ -72,6 +72,7 @@ int main(int argc, char **argv)
         SRC_FOLDER"tui.c",
         SRC_FOLDER"executor.c",
         SRC_FOLDER"shell.c",
+        SRC_FOLDER"session.c",
         SRC_FOLDER"path_util.c",
     };
     size_t common_count = sizeof(common_srcs) / sizeof(common_srcs[0]);

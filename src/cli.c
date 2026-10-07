@@ -35,6 +35,15 @@ void cli_print_help(const char *invoked_as)
     printf("  -q, --quiet                           Suppress non-essential messages\n");
     printf("  -i, --interactive                     Always prompt with TUI selector\n");
     printf("  -y, --yes                             Skip confirmation for destructive commands\n");
+    printf("  -s, --session                         Open a tmux session in the directory\n");
+    printf("  -a, --all                             Run the command in every directory with that exact name\n");
+    printf("  -m, --multi                           Pick directories to run the command in (Tab marks)\n");
+    printf("\n");
+    printf("Targets:\n");
+    printf("  <name>                                Best match by name, ranked by frecency\n");
+    printf("  <part>/<name>                         Match path parts in order, e.g. dev/api\n");
+    printf("  @, @/<sub>                            Root of the current project (git root or nearest marker)\n");
+    printf("  <bookmark>, <bookmark>/<sub>          A directory saved with `%s mark`\n", prog_name);
     printf("\n");
     printf("Database & Maintenance Commands:\n");
     printf("  %s add <path>                         Add or update directory in database\n", prog_name);
@@ -44,6 +53,11 @@ void cli_print_help(const char *invoked_as)
     printf("  %s prune                              Remove non-existent directories from database\n", prog_name);
     printf("  %s reindex                            Rebuild the cached directory index now\n", prog_name);
     printf("  %s doctor                             Check environment, database, and search roots\n", prog_name);
+    printf("\n");
+    printf("Bookmarks:\n");
+    printf("  %s mark                               List bookmarks\n", prog_name);
+    printf("  %s mark <name> [path]                 Bookmark a directory (default: current one)\n", prog_name);
+    printf("  %s unmark <name>                      Remove a bookmark\n", prog_name);
     printf("\n");
     printf("Configuration Commands:\n");
     printf("  %s config                             Open interactive config TUI (edits TOML)\n", prog_name);
@@ -55,6 +69,19 @@ void cli_print_help(const char *invoked_as)
     printf("\n");
     printf("Shell Integration:\n");
     printf("  %s --init <bash|zsh|fish>             Generate shell integration script\n", prog_name);
+}
+
+bool cli_is_reserved_word(const char *word)
+{
+    static const char *const words[] = {
+        "help", "version", "add", "remove", "list", "query", "prune", "reindex",
+        "doctor", "config", "shell", "root", "cd", "mark", "unmark",
+    };
+    if (!word) return false;
+    for (size_t i = 0; i < sizeof(words) / sizeof(words[0]); ++i) {
+        if (strcmp(word, words[i]) == 0) return true;
+    }
+    return false;
 }
 
 void cli_free_args(Cli_Args *args)
@@ -78,6 +105,12 @@ static bool parse_modifier_flag(const char *arg, Cli_Args *args)
         args->interactive = true;
     } else if (strcmp(arg, "-y") == 0 || strcmp(arg, "--yes") == 0) {
         args->yes = true;
+    } else if (strcmp(arg, "-s") == 0 || strcmp(arg, "--session") == 0) {
+        args->session = true;
+    } else if (strcmp(arg, "-a") == 0 || strcmp(arg, "--all") == 0) {
+        args->all = true;
+    } else if (strcmp(arg, "-m") == 0 || strcmp(arg, "--multi") == 0) {
+        args->multi = true;
     } else {
         return false;
     }
@@ -143,6 +176,10 @@ bool cli_parse(int argc, char **argv, Cli_Args *args)
             args->action = CLI_ACTION_COMPLETE_TARGET;
             i++;
             args->target = dup_str(i < argc ? argv[i] : "");
+            return true;
+        } else if (strcmp(argv[i], "--complete-mark") == 0) {
+            // Called by the shell completion scripts; not listed in --help.
+            args->action = CLI_ACTION_COMPLETE_MARK;
             return true;
         } else if (strcmp(argv[i], "--resolve") == 0) {
             // Called by the shell completion scripts; not listed in --help.
@@ -252,6 +289,25 @@ bool cli_parse(int argc, char **argv, Cli_Args *args)
         } else {
             jrun_log_error("unknown root subcommand '%s'", argv[i]);
             return false;
+        }
+        return true;
+    } else if (strcmp(first, "mark") == 0) {
+        i++;
+        if (i >= argc || strcmp(argv[i], "list") == 0) {
+            args->action = CLI_ACTION_MARK_LIST;
+            return true;
+        }
+        args->action = CLI_ACTION_MARK_ADD;
+        args->target = dup_str(argv[i++]);
+        if (i < argc) {
+            args->extra_arg = dup_str(argv[i]);
+        }
+        return true;
+    } else if (strcmp(first, "unmark") == 0) {
+        args->action = CLI_ACTION_MARK_REMOVE;
+        i++;
+        if (i < argc) {
+            args->target = dup_str(argv[i]);
         }
         return true;
     } else if (strcmp(first, "cd") == 0) {

@@ -15,6 +15,12 @@ bool tui_available(void);
 // Returns the chosen path (caller frees), or NULL when the user cancelled.
 char *tui_select(const Resolve_Candidate *candidates, size_t count, const char *initial_query);
 
+// Like tui_select(), but Tab marks several rows. On Enter, *out_indices holds
+// the marked candidates in ranking order, or just the one under the cursor
+// when none are marked; the caller frees it. Returns false when cancelled.
+bool tui_select_many(const Resolve_Candidate *candidates, size_t count, const char *initial_query,
+                     size_t **out_indices, size_t *out_count);
+
 bool tui_confirm_command(const char *working_dir, char *const argv[]);
 bool tui_edit_config(Jrun_Config *config, const char *filepath);
 

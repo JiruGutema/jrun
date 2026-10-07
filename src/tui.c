@@ -432,7 +432,6 @@ enum Tui_Key {
     KEY_DELETE,
     KEY_CLEAR,
     KEY_KILL_WORD,
-    KEY_KILL_LINE,
     KEY_LINE_START,
     KEY_LINE_END,
     KEY_TAB,
@@ -533,14 +532,15 @@ static Input_Event read_input(void)
     }
 
     switch (c) {
-    case 13: case 10: return (Input_Event){ .key = KEY_ENTER };
+    case 13:  return (Input_Event){ .key = KEY_ENTER };
     case 127: case 8:  return (Input_Event){ .key = KEY_BACKSPACE };
     case 1:   return (Input_Event){ .key = KEY_LINE_START };  // C-a
     case 3:   return (Input_Event){ .key = KEY_ESC };         // C-c
     case 4:   return (Input_Event){ .key = KEY_ESC };         // C-d
     case 5:   return (Input_Event){ .key = KEY_LINE_END };    // C-e
     case 9:   return (Input_Event){ .key = KEY_TAB };
-    case 11:  return (Input_Event){ .key = KEY_KILL_LINE };   // C-k
+    case 10:  return (Input_Event){ .key = KEY_DOWN };        // C-j
+    case 11:  return (Input_Event){ .key = KEY_UP };          // C-k
     case 12:  return (Input_Event){ .key = KEY_REFRESH };     // C-l
     case 14:  return (Input_Event){ .key = KEY_DOWN };        // C-n
     case 16:  return (Input_Event){ .key = KEY_UP };          // C-p
@@ -727,13 +727,18 @@ static const char *scrollbar_cell(size_t total, size_t visible, size_t offset, i
     return (row >= pos && row < pos + thumb) ? "█" : "░";
 }
 
-char *tui_select(const Resolve_Candidate *candidates, size_t count, const char *initial_query)
+// The selector behind tui_select() and tui_select_many(). With `marks`
+// non-NULL, Tab marks rows and marks[i] is set for each marked candidate.
+// Returns the index of the candidate under the cursor when Enter is pressed,
+// or -1 when cancelled or nothing was left to pick.
+static ssize_t run_selector(const Resolve_Candidate *candidates, size_t count,
+                            const char *initial_query, unsigned char *marks)
 {
-    if (!candidates || count == 0) return NULL;
+    if (!candidates || count == 0) return -1;
 
     if (!enable_raw_mode()) {
         jrun_log_error("no terminal available for the interactive selector");
-        return NULL;
+        return -1;
     }
 
     struct sigaction sa, old_sa, sa_win, old_win;
@@ -763,12 +768,13 @@ char *tui_select(const Resolve_Candidate *candidates, size_t count, const char *
         disable_raw_mode();
         sigaction(SIGINT, &old_sa, NULL);
         sigaction(SIGWINCH, &old_win, NULL);
-        return NULL;
+        return -1;
     }
 
     size_t selected = 0;
     size_t scroll_offset = 0;
-    char *result_path = NULL;
+    ssize_t result = -1;
+    size_t marked_count = 0;
     bool needs_redraw = true;
     bool needs_filter = true;
     size_t filtered_count = 0;
@@ -837,9 +843,14 @@ char *tui_select(const Resolve_Candidate *candidates, size_t count, const char *
             buf.len = 0;
             buf_puts(&buf, "\x1b[H\x1b[?25l");
 
-            char badge[32];
-            snprintf(badge, sizeof(badge), "%zu/%zu", filtered_count, count);
-            draw_title(&buf, "Jump to", badge, width);
+            char badge[64];
+            if (marked_count > 0) {
+                snprintf(badge, sizeof(badge), "%zu/%zu · %zu marked",
+                         filtered_count, count, marked_count);
+            } else {
+                snprintf(badge, sizeof(badge), "%zu/%zu", filtered_count, count);
+            }
+            draw_title(&buf, marks ? "Run in" : "Jump to", badge, width);
 
             // Query line.
             char safe_query[256];
@@ -891,18 +902,28 @@ char *tui_select(const Resolve_Candidate *candidates, size_t count, const char *
                 int score_w = show_score ? 7 : 0;
                 int scroll_w = (filtered_count > (size_t)list_height) ? 1 : 0;
 
-                // 2 columns for the cursor gutter, 1 spacer before the score.
-                int path_w = inner - 2 - score_w - kind_w - scroll_w;
+                // The cursor gutter, plus a mark column when marking is on.
+                int gutter = marks ? 4 : 2;
+                int path_w = inner - gutter - score_w - kind_w - scroll_w;
                 if (path_w < 6) path_w = 6;
 
                 if (is_sel) buf_puts(&buf, SGR_SELECTED);
                 buf_puts(&buf, is_sel ? "❯ " : "  ");
+                if (marks) {
+                    if (!marks[filtered[item_idx].index]) {
+                        buf_puts(&buf, "  ");
+                    } else if (is_sel) {
+                        buf_puts(&buf, "● ");
+                    } else {
+                        buf_puts(&buf, SGR_ACCENT "● " SGR_RESET);
+                    }
+                }
 
                 bool ellipsis = false;
                 size_t from = fit_tail(disp, path_w, &ellipsis);
-                int used = 2 + draw_highlighted(&buf, disp, mask, from, ellipsis, path_w, is_sel);
-                draw_pad(&buf, path_w - (used - 2));
-                used = 2 + path_w;
+                int used = gutter + draw_highlighted(&buf, disp, mask, from, ellipsis, path_w, is_sel);
+                draw_pad(&buf, path_w - (used - gutter));
+                used = gutter + path_w;
 
                 if (kind) {
                     if (!is_sel) buf_puts(&buf, SGR_ACCENT);
@@ -934,9 +955,14 @@ char *tui_select(const Resolve_Candidate *candidates, size_t count, const char *
 
             draw_rule(&buf, "├", "┤", width);
 
-            const char *footer = (width >= 62)
-                ? "↑↓ move · ⏎ open · ^W word · ^U clear · esc cancel"
-                : (width >= 30) ? "↑↓ · ⏎ open · esc" : "⏎ · esc";
+            const char *footer;
+            if (marks) {
+                footer = (width >= 62) ? "⇥ mark · ↑↓ move · ⏎ run · ^U clear · esc cancel"
+                       : (width >= 30) ? "⇥ mark · ⏎ run · esc" : "⇥ · ⏎ · esc";
+            } else {
+                footer = (width >= 62) ? "↑↓ move · ⏎ open · ^W word · ^U clear · esc cancel"
+                       : (width >= 30) ? "↑↓ · ⏎ open · esc" : "⏎ · esc";
+            }
             buf_puts(&buf, "│ " SGR_DIM);
             buf_puts(&buf, footer);
             buf_puts(&buf, SGR_RESET);
@@ -967,9 +993,19 @@ char *tui_select(const Resolve_Candidate *candidates, size_t count, const char *
 
         case KEY_ENTER:
             if (filtered_count > 0 && selected < filtered_count) {
-                result_path = jrun_strdup(candidates[filtered[selected].index].path);
+                result = (ssize_t)filtered[selected].index;
             }
             goto done;
+
+        case KEY_TAB:
+            if (marks && filtered_count > 0 && selected < filtered_count) {
+                unsigned char *m = &marks[filtered[selected].index];
+                *m = !*m;
+                marked_count = *m ? marked_count + 1 : marked_count - 1;
+                if (selected + 1 < filtered_count) selected++;
+                needs_redraw = true;
+            }
+            break;
 
         case KEY_UP:
             if (selected > 0) selected--;
@@ -1047,13 +1083,6 @@ char *tui_select(const Resolve_Candidate *candidates, size_t count, const char *
             }
             break;
 
-        case KEY_KILL_LINE:
-            query[qcursor] = '\0';
-            qlen = qcursor;
-            selected = 0;
-            needs_filter = true;
-            break;
-
         case KEY_CLEAR:
             query[0] = '\0';
             qlen = 0;
@@ -1096,7 +1125,52 @@ done:
     sigaction(SIGINT, &old_sa, NULL);
     sigaction(SIGWINCH, &old_win, NULL);
 
-    return result_path;
+    return result;
+}
+
+char *tui_select(const Resolve_Candidate *candidates, size_t count, const char *initial_query)
+{
+    ssize_t idx = run_selector(candidates, count, initial_query, NULL);
+    return idx >= 0 ? jrun_strdup(candidates[idx].path) : NULL;
+}
+
+bool tui_select_many(const Resolve_Candidate *candidates, size_t count, const char *initial_query,
+                     size_t **out_indices, size_t *out_count)
+{
+    *out_indices = NULL;
+    *out_count = 0;
+    if (!candidates || count == 0) return false;
+
+    unsigned char *marks = (unsigned char *)calloc(count, 1);
+    if (!marks) return false;
+
+    ssize_t idx = run_selector(candidates, count, initial_query, marks);
+    if (idx < 0) {
+        free(marks);
+        return false;
+    }
+
+    // Enter with nothing marked means just the row under the cursor.
+    size_t n = 0;
+    for (size_t i = 0; i < count; ++i) n += marks[i];
+    if (n == 0) {
+        marks[idx] = 1;
+        n = 1;
+    }
+
+    size_t *indices = (size_t *)malloc(n * sizeof(size_t));
+    if (!indices) {
+        free(marks);
+        return false;
+    }
+    n = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (marks[i]) indices[n++] = i;
+    }
+    free(marks);
+    *out_indices = indices;
+    *out_count = n;
+    return true;
 }
 
 // ---------------------------------------------------------------------------

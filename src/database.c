@@ -78,6 +78,11 @@ bool db_init(const char *db_path)
         "CREATE TABLE IF NOT EXISTS meta ("
         "    key TEXT PRIMARY KEY,"
         "    value TEXT NOT NULL"
+        ");"
+        // Names pinned to a directory with `jrun mark`.
+        "CREATE TABLE IF NOT EXISTS bookmarks ("
+        "    name TEXT PRIMARY KEY,"
+        "    path TEXT NOT NULL"
         ");";
 
     char *err_msg = NULL;
@@ -550,4 +555,128 @@ bool db_cache_stats(size_t *count, int64_t *built_at)
         *built_at = db_meta_get("scan_time", buf, sizeof(buf)) ? (int64_t)strtoll(buf, NULL, 10) : 0;
     }
     return true;
+}
+
+// --- Bookmarks ---------------------------------------------------------------
+
+bool db_bookmark_set(const char *name, const char *path)
+{
+    if (!g_db || !name || name[0] == '\0' || !path) return false;
+
+    char normalized[PATH_MAX];
+    if (!path_normalize(path, normalized, sizeof(normalized))) {
+        jrun_log_error("failed to normalize path '%s'", path);
+        return false;
+    }
+    if (!path_is_dir(normalized)) {
+        jrun_log_error("not a directory: %s", normalized);
+        return false;
+    }
+
+    const char *sql =
+        "INSERT INTO bookmarks (name, path) VALUES (?1, ?2) "
+        "ON CONFLICT(name) DO UPDATE SET path = ?2;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        jrun_log_error("sqlite prepare failed: %s", sqlite3_errmsg(g_db));
+        return false;
+    }
+    sqlite3_bind_text(stmt, 1, name, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, normalized, -1, SQLITE_STATIC);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE;
+}
+
+bool db_bookmark_remove(const char *name, bool *removed)
+{
+    if (removed) *removed = false;
+    if (!g_db || !name) return false;
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(g_db, "DELETE FROM bookmarks WHERE name = ?1;", -1, &stmt, NULL) != SQLITE_OK) {
+        return false;
+    }
+    sqlite3_bind_text(stmt, 1, name, -1, SQLITE_STATIC);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) return false;
+    if (removed) *removed = sqlite3_changes(g_db) > 0;
+    return true;
+}
+
+bool db_bookmark_get(const char *name, char **out_path)
+{
+    if (!out_path) return false;
+    *out_path = NULL;
+    if (!g_db || !name) return false;
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(g_db, "SELECT path FROM bookmarks WHERE name = ?1;", -1, &stmt, NULL) != SQLITE_OK) {
+        return false;
+    }
+    sqlite3_bind_text(stmt, 1, name, -1, SQLITE_STATIC);
+    bool ok = true;
+    int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        const char *p = (const char *)sqlite3_column_text(stmt, 0);
+        *out_path = jrun_strdup(p ? p : "");
+        ok = *out_path != NULL;
+    } else if (rc != SQLITE_DONE) {
+        ok = false;
+    }
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+bool db_bookmark_list(Db_Bookmark **out, size_t *count)
+{
+    if (!out || !count) return false;
+    *out = NULL;
+    *count = 0;
+    if (!g_db) return false;
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(g_db, "SELECT name, path FROM bookmarks ORDER BY name;", -1, &stmt, NULL) != SQLITE_OK) {
+        jrun_log_error("sqlite prepare failed: %s", sqlite3_errmsg(g_db));
+        return false;
+    }
+
+    Db_Bookmark *list = NULL;
+    size_t n = 0, capacity = 0;
+    bool ok = true;
+    int rc;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        JRUN_DA_GROW(list, n, capacity, 16, ok);
+        if (!ok) break;
+        const char *name = (const char *)sqlite3_column_text(stmt, 0);
+        const char *path = (const char *)sqlite3_column_text(stmt, 1);
+        list[n].name = jrun_strdup(name ? name : "");
+        list[n].path = jrun_strdup(path ? path : "");
+        n++;
+        if (!list[n - 1].name || !list[n - 1].path) {
+            ok = false;
+            break;
+        }
+    }
+    if (ok && rc != SQLITE_ROW && rc != SQLITE_DONE) ok = false;
+    sqlite3_finalize(stmt);
+
+    if (!ok) {
+        db_free_bookmarks(list, n);
+        return false;
+    }
+    *out = list;
+    *count = n;
+    return true;
+}
+
+void db_free_bookmarks(Db_Bookmark *bookmarks, size_t count)
+{
+    if (!bookmarks) return;
+    for (size_t i = 0; i < count; ++i) {
+        free(bookmarks[i].name);
+        free(bookmarks[i].path);
+    }
+    free(bookmarks);
 }

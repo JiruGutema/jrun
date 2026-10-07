@@ -191,9 +191,10 @@ static bool match_multicomponent(const char *target, const char *path, double *q
     if (strlen(target) >= sizeof(target_copy)) return false;
     memcpy(target_copy, target, strlen(target) + 1);
 
+    // Match below $HOME only: for a user named "devon", "dev/api" would
+    // otherwise match every api directory they have.
     char path_copy[PATH_MAX];
-    if (strlen(path) >= sizeof(path_copy)) return false;
-    memcpy(path_copy, path, strlen(path) + 1);
+    if (!path_shorten_tilde(path, path_copy, sizeof(path_copy))) return false;
 
     const char *tparts[MATCH_MAX_TARGET_PARTS];
     size_t nt = 0;
@@ -214,28 +215,34 @@ static bool match_multicomponent(const char *target, const char *path, double *q
         pparts[np++] = tok;
     }
 
-    size_t pi = 0;
-    int matched = 0;
+    if (np < nt) return false;
+
+    // The last part names the directory itself. Letting it match any
+    // component meant "dev/jrun" also matched every directory under jrun.
     double total_q = 0.0;
-    for (size_t ti = 0; ti < nt; ++ti) {
+    double q = 0.0;
+    if (!component_matches(tparts[nt - 1], pparts[np - 1], &q)) return false;
+    total_q += q;
+
+    // The parts before it match ancestors in order, skipping any between, so
+    // "dev/const" finds ~/development/Mereb/constituent.
+    size_t pi = 0;
+    for (size_t ti = 0; ti + 1 < nt; ++ti) {
         bool found = false;
-        while (pi < np) {
-            double q = 0.0;
-            if (component_matches(tparts[ti], pparts[pi], &q)) {
+        while (pi + 1 < np) {
+            if (component_matches(tparts[ti], pparts[pi++], &q)) {
                 total_q += q;
-                matched++;
-                pi++;
                 found = true;
                 break;
             }
-            pi++;
         }
         if (!found) return false;
     }
 
-    if (matched != (int)nt) return false;
+    // component_matches() scores at most 20 per part, so this spreads closer
+    // matches across 55..95 instead of letting every one hit the ceiling.
     if (quality_out) {
-        *quality_out = 70.0 + total_q;
+        *quality_out = 55.0 + 40.0 * (total_q / (20.0 * (double)nt));
         if (*quality_out > 95.0) *quality_out = 95.0;
     }
     return true;

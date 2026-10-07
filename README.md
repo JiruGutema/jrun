@@ -40,6 +40,12 @@ directory jumping (like `zoxide`) with a project resolver and an arbitrary comma
   even when jrun's stdout is captured by the shell integration.
 - **Directory jumper and shell integration** — a `j` function for Bash, Zsh and Fish with
   automatic directory tracking.
+- **Bookmarks** — pin a name to a directory with `jrun mark`, so it always wins over matching.
+- **Path parts and project root** — `j dev/api` matches path components in order, and `j @`
+  goes to the root of the project you are in.
+- **Several directories at once** — run a command in every directory with a name (`-a`), or
+  pick them in the selector (`-m`).
+- **tmux sessions** — `jrun -s api` opens or switches to a tmux session rooted in the project.
 - **Light dependencies** — C11, POSIX, pthreads and the system SQLite library.
 
 ---
@@ -121,10 +127,12 @@ If a target matches several directories:
 | Key                            | Action                                          |
 | ------------------------------ | ----------------------------------------------- |
 | `↑` `↓`, `Ctrl-P` `Ctrl-N`     | Move through candidates (wraps)                 |
+| `Ctrl-K` `Ctrl-J`              | Move up / down, like `Ctrl-P` / `Ctrl-N`         |
+| `Tab`                          | Mark a row and move down (with `-m` only)        |
 | `PgUp` `PgDn`, `Home` `End`    | Jump a page, or to the ends                     |
 | type                           | Filter live; matched characters are highlighted |
 | `←` `→`, `Ctrl-A` `Ctrl-E`     | Move the cursor within the query                |
-| `Ctrl-W` / `Ctrl-U` / `Ctrl-K` | Delete a word / clear / kill to end             |
+| `Ctrl-W` / `Ctrl-U`            | Delete a word / clear the query                 |
 | `Ctrl-L`                       | Redraw                                          |
 | `Enter`                        | Select                                          |
 | `Esc`, `Ctrl-C`                | Cancel (exit status 130)                        |
@@ -138,6 +146,74 @@ directory holding a project file. Both are dropped automatically on narrow termi
 jrun constituent        # print the resolved path
 jrun --cd constituent   # same thing, explicitly
 ```
+
+### 4. Path parts
+
+A target containing `/` is matched part by part. The last part must match the directory's own
+name, and the parts before it must match its parent directories in order, with any number of
+directories in between allowed:
+
+```bash
+j dev/const       # ~/development/Mereb/constituent, not ~/Documents/constituent
+j proj/const/src  # ~/projects/constituent/src
+```
+
+Only directories below `$HOME` are compared, so your home path itself never matches. A relative
+path that actually exists from where you are (`j src/lib`) is still used as-is.
+
+### 5. Project root
+
+`@` is the root of the project holding the current directory: the nearest enclosing
+repository (`.git`, `.hg`, `.svn`), or, outside a repository, the nearest directory with a
+project file such as `package.json` or `Cargo.toml`.
+
+```bash
+j @                 # from ~/dev/api/src/handlers/v2 to ~/dev/api
+j @/docs            # ~/dev/api/docs
+jrun @ make test    # run in the project root without leaving where you are
+```
+
+When you are already at a repository root, `@` moves out to the enclosing one, so repeating
+`j @` climbs out of nested repositories such as submodules.
+
+### 6. Bookmarks
+
+```bash
+jrun mark api                       # bookmark the current directory as "api"
+jrun mark api ~/work/platform/api   # or a given path; marking again repoints it
+jrun mark                           # list bookmarks (also: jrun mark list)
+jrun unmark api
+
+j api               # always ~/work/platform/api, whatever else is called api
+j api/src           # a directory inside the bookmark
+```
+
+Bookmarks are checked before any matching and are offered first by tab completion. Names
+cannot contain `/` or spaces, start with `-`, `@`, `.` or `~`, or be a jrun subcommand.
+
+### 7. Running in several directories
+
+```bash
+jrun -a constituent git status   # every directory named exactly "constituent"
+jrun -m proj git pull            # choose in the selector: Tab marks, Enter runs
+```
+
+`-a` only takes directories whose name matches the target exactly, so a loose query never
+sweeps in unrelated ones; use `-m` to pick from looser matches. The commands run one after
+another under a `==> directory` header. A failure does not stop the rest, but `Ctrl-C` does.
+Destructive commands are confirmed once for the whole set.
+
+### 8. tmux sessions
+
+```bash
+jrun -s api         # open or switch to a tmux session in api
+j api -s            # same
+```
+
+A session already rooted in that directory is reused. Otherwise a new one is created and named
+after the directory (`.` and `:` become `_`). If that name is taken by a session elsewhere, the
+parent's name is added (`work_api`), then a number (`api-2`). Inside tmux the current client
+switches to the session; outside, jrun is replaced by `tmux attach`.
 
 ---
 
@@ -209,6 +285,15 @@ Options:
   -q, --quiet         Suppress non-essential messages
   -i, --interactive   Always show the selector
   -y, --yes           Skip confirmation for destructive commands
+  -s, --session       Open a tmux session in the directory
+  -a, --all           Run the command in every directory with that exact name
+  -m, --multi         Pick directories to run the command in (Tab marks)
+
+Targets:
+  <name>              Best match by name, ranked by frecency
+  <part>/<name>       Match path parts in order, e.g. dev/api
+  @, @/<sub>          Root of the current project
+  <bookmark>[/<sub>]  A directory saved with `jrun mark`
 
 Database & maintenance:
   jrun add <path>     Add or update a directory in the database
@@ -218,6 +303,11 @@ Database & maintenance:
   jrun prune          Drop directories that no longer exist
   jrun reindex        Rebuild the cached directory index now
   jrun doctor         Report environment, database, index and root diagnostics
+
+Bookmarks:
+  jrun mark                 List bookmarks
+  jrun mark <name> [path]   Bookmark a directory (default: the current one)
+  jrun unmark <name>        Remove a bookmark
 
 Configuration:
   jrun config         Open the configuration editor
@@ -327,6 +417,7 @@ jrun/
 │   ├── tui.h / .c       # /dev/tty terminal UI: selector, confirm, config editor
 │   ├── executor.h / .c  # fork/chdir/execvp process runner
 │   ├── shell.h / .c     # Shell integration generators
+│   ├── session.h / .c   # tmux session lookup, creation and attach
 │   ├── path_util.h / .c # Path normalization, project markers, atomic writes
 │   └── common.h         # Shared definitions and logging macros
 ├── tests/

@@ -12,6 +12,8 @@ typedef struct {
     double match_quality;
     bool is_exact_basename;
     bool from_db;
+    // Reached through a `jrun mark` bookmark rather than by matching.
+    bool is_bookmark;
     // Short label such as "rust" or "git" when the directory holds a project
     // marker, else NULL. Points at a string literal; never freed.
     const char *project_kind;
@@ -30,6 +32,10 @@ typedef struct {
     Resolve_Status status;
 } Resolve_Result;
 
+// Besides ordinary names and paths, `target` may be:
+//   @, @/sub      the root of the project holding the working directory
+//   name, name/sub  a bookmark made with `jrun mark`
+// Both resolve to a single candidate without any matching.
 Resolve_Result resolver_resolve(const char *target, const Jrun_Config *config, bool force_scan);
 void resolver_free_result(Resolve_Result *res);
 
@@ -41,6 +47,16 @@ void resolver_free_result(Resolve_Result *res);
 bool resolver_complete(const char *prefix, const Jrun_Config *config, size_t limit,
                        char ***out_names, size_t *out_count);
 void resolver_free_names(char **names, size_t count);
+
+// True for "@" and "@/...", the targets naming the current project root.
+bool resolver_is_project_target(const char *target);
+
+// The root of the project holding `from`: the nearest enclosing repository
+// (.git, .hg, .svn), or failing that the nearest directory with any project
+// marker. When `from` is itself a project root the search starts from its
+// parent, so going to the root again climbs out to an enclosing project.
+// Returns false when `from` is in no project.
+bool resolver_project_root(const char *from, char *out, size_t out_size);
 
 // Rebuilds the cached filesystem index up front. Returns the number of
 // directories indexed via *out_count.

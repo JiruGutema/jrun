@@ -40,6 +40,7 @@ COMMON_SRCS = src/cli.c \
               src/tui.c \
               src/executor.c \
               src/shell.c \
+              src/session.c \
               src/path_util.c
 
 COMMON_OBJS = $(COMMON_SRCS:src/%.c=$(BUILD_DIR)/%.o)

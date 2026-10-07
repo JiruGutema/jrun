@@ -254,12 +254,171 @@ static void apply_project_bonus(Resolve_Candidate *candidates, size_t count)
     }
 }
 
-Resolve_Result resolver_resolve(const char *target, const Jrun_Config *config, bool force_scan)
+bool resolver_is_project_target(const char *target)
+{
+    return target && target[0] == '@' && (target[1] == '\0' || target[1] == '/');
+}
+
+static bool is_vcs_root(const char *path)
+{
+    static const char *const markers[] = { ".git", ".hg", ".svn" };
+    char probe[PATH_MAX];
+    for (size_t i = 0; i < sizeof(markers) / sizeof(markers[0]); ++i) {
+        int n = snprintf(probe, sizeof(probe), "%s/%s", path, markers[i]);
+        if (n > 0 && (size_t)n < sizeof(probe) && path_exists(probe)) return true;
+    }
+    return false;
+}
+
+// Cuts the last component off `path` in place. False once at "/".
+static bool path_to_parent(char *path)
+{
+    char *slash = strrchr(path, '/');
+    if (!slash || (slash == path && path[1] == '\0')) return false;
+    if (slash == path) slash[1] = '\0';
+    else *slash = '\0';
+    return true;
+}
+
+// Walks up from `start`, inclusive, to the first directory that is a
+// repository root, or with any_marker, that holds any project marker.
+static bool find_enclosing(const char *start, bool any_marker, char *out, size_t out_size)
+{
+    char cur[PATH_MAX];
+    snprintf(cur, sizeof(cur), "%s", start);
+    do {
+        if (any_marker ? path_is_project_dir(cur) : is_vcs_root(cur)) {
+            int n = snprintf(out, out_size, "%s", cur);
+            return n > 0 && (size_t)n < out_size;
+        }
+    } while (path_to_parent(cur));
+    return false;
+}
+
+bool resolver_project_root(const char *from, char *out, size_t out_size)
+{
+    char here[PATH_MAX];
+    if (!from || !path_normalize(from, here, sizeof(here))) return false;
+
+    // A directory with its own marker is a root unless it sits inside a
+    // repository; a Makefile in src/ should not stop the climb.
+    char scratch[PATH_MAX];
+    bool at_root = is_vcs_root(here) ||
+                   (path_is_project_dir(here) && !find_enclosing(here, false, scratch, sizeof(scratch)));
+
+    char start[PATH_MAX];
+    snprintf(start, sizeof(start), "%s", here);
+    if (!at_root || path_to_parent(start)) {
+        if (find_enclosing(start, false, out, out_size)) return true;
+        if (find_enclosing(start, true, out, out_size)) return true;
+    }
+
+    // Nothing encloses this root, so it is as far up as `@` goes.
+    if (at_root) {
+        int n = snprintf(out, out_size, "%s", here);
+        return n > 0 && (size_t)n < out_size;
+    }
+    return false;
+}
+
+// Appends "/rest" to `base` when `rest` is non-empty, normalizes the result
+// and checks it is a directory.
+static bool join_existing_dir(const char *base, const char *rest, char *out, size_t out_size)
+{
+    char joined[PATH_MAX];
+    int n = (rest && rest[0])
+          ? snprintf(joined, sizeof(joined), "%s/%s", base, rest)
+          : snprintf(joined, sizeof(joined), "%s", base);
+    if (n <= 0 || (size_t)n >= sizeof(joined)) return false;
+    return path_normalize(joined, out, out_size) && path_is_dir(out);
+}
+
+// "@" or "@/sub" relative to the working directory's project root.
+static bool project_target_path(const char *target, char *out, size_t out_size)
+{
+    char cwd[PATH_MAX];
+    char root[PATH_MAX];
+    if (!getcwd(cwd, sizeof(cwd))) return false;
+    if (!resolver_project_root(cwd, root, sizeof(root))) return false;
+    return join_existing_dir(root, target[1] == '/' ? target + 2 : "", out, out_size);
+}
+
+// "name" or "name/sub" where name is a bookmark. A relative path that exists
+// from here is left alone, as `cd` would take it.
+static bool bookmark_target_path(const char *target, char *out, size_t out_size)
+{
+    char direct[PATH_MAX];
+    if (target_looks_like_path(target) &&
+        path_normalize(target, direct, sizeof(direct)) && path_is_dir(direct)) {
+        return false;
+    }
+
+    char name[256];
+    const char *slash = strchr(target, '/');
+    size_t name_len = slash ? (size_t)(slash - target) : strlen(target);
+    if (name_len == 0 || name_len >= sizeof(name)) return false;
+    memcpy(name, target, name_len);
+    name[name_len] = '\0';
+
+    char *marked = NULL;
+    if (!db_bookmark_get(name, &marked) || !marked) return false;
+
+    bool ok = join_existing_dir(marked, slash ? slash + 1 : "", out, out_size);
+    if (!ok) {
+        jrun_log_error("bookmark '%s' points to %s, which is not a directory%s", name, marked,
+                       slash ? " (or has no such subdirectory)" : "");
+    }
+    free(marked);
+    return ok;
+}
+
+static Resolve_Result single_result(const char *path, bool is_bookmark)
+{
+    Resolve_Result result = {0};
+    result.status = RESOLVE_NO_MATCH;
+    Resolve_Candidate *cand = (Resolve_Candidate *)calloc(1, sizeof(Resolve_Candidate));
+    char *copy = jrun_strdup(path);
+    if (!cand || !copy) {
+        free(cand);
+        free(copy);
+        return result;
+    }
+    *cand = (Resolve_Candidate){
+        .path = copy,
+        .score = 1000.0,
+        .match_quality = 150.0,
+        .is_exact_basename = true,
+        .is_bookmark = is_bookmark,
+        .project_kind = path_project_kind(copy),
+    };
+    result.candidates = cand;
+    result.count = 1;
+    result.status = RESOLVE_SINGLE_MATCH;
+    return result;
+}
+
+// `shortcuts` enables bookmarks and "@". Completion turns them off: a prefix
+// that happens to spell a bookmark must still complete to other names.
+static Resolve_Result resolve_impl(const char *target, const Jrun_Config *config,
+                                   bool force_scan, bool shortcuts)
 {
     Resolve_Result result = {0};
     if (!target || target[0] == '\0') {
         result.status = RESOLVE_NO_MATCH;
         return result;
+    }
+
+    // Targets that name one directory outright skip matching altogether.
+    char exact[PATH_MAX];
+    if (shortcuts && resolver_is_project_target(target)) {
+        if (!project_target_path(target, exact, sizeof(exact))) {
+            result.status = RESOLVE_NO_MATCH;
+            return result;
+        }
+        return single_result(exact, false);
+    }
+    if (shortcuts && bookmark_target_path(target, exact, sizeof(exact))) {
+        return single_result(exact, true);
     }
 
     bool enable_fuzzy = config ? config->fuzzy : true;
@@ -413,6 +572,11 @@ Resolve_Result resolver_resolve(const char *target, const Jrun_Config *config, b
     return result;
 }
 
+Resolve_Result resolver_resolve(const char *target, const Jrun_Config *config, bool force_scan)
+{
+    return resolve_impl(target, config, force_scan, true);
+}
+
 typedef struct {
     char **items;
     size_t count;
@@ -427,12 +591,10 @@ static bool name_list_contains(const Name_List *list, const char *name)
     return false;
 }
 
-// Adds the final component of `path` unless it is already listed or the list
-// is full. Returns false only on allocation failure.
-static bool name_list_add_basename(Name_List *list, const char *path, size_t limit)
+// Adds `name` unless it is already listed or the list is full. Returns false
+// only on allocation failure.
+static bool name_list_add(Name_List *list, const char *name, size_t limit)
 {
-    char name[PATH_MAX];
-    path_basename_r(path, name, sizeof(name));
     if (name[0] == '\0' || strcmp(name, "/") == 0) return true;
     if (list->count >= limit || name_list_contains(list, name)) return true;
 
@@ -443,6 +605,14 @@ static bool name_list_add_basename(Name_List *list, const char *path, size_t lim
     if (!copy) return false;
     list->items[list->count++] = copy;
     return true;
+}
+
+// Adds the final component of `path`.
+static bool name_list_add_basename(Name_List *list, const char *path, size_t limit)
+{
+    char name[PATH_MAX];
+    path_basename_r(path, name, sizeof(name));
+    return name_list_add(list, name, limit);
 }
 
 static int compare_entries_by_frecency_desc(const void *a, const void *b)
@@ -463,12 +633,26 @@ bool resolver_complete(const char *prefix, const Jrun_Config *config, size_t lim
     if (limit == 0) return true;
     if (!prefix) prefix = "";
 
-    // Paths are completed by the shell's own directory completion.
-    if (target_looks_like_path(prefix)) return true;
+    // Paths are completed by the shell's own directory completion, and "@"
+    // already says exactly where to go.
+    if (target_looks_like_path(prefix) || prefix[0] == '@') return true;
 
     Name_List prefixed = {0};
     Name_List others = {0};
     bool ok = true;
+
+    // Bookmarks are the names the user chose, so they come first.
+    size_t prefix_len = strlen(prefix);
+    Db_Bookmark *marks = NULL;
+    size_t mark_count = 0;
+    if (db_bookmark_list(&marks, &mark_count)) {
+        for (size_t i = 0; i < mark_count && ok; ++i) {
+            if (strncmp(marks[i].name, prefix, prefix_len) == 0) {
+                ok = name_list_add(&prefixed, marks[i].name, limit);
+            }
+        }
+        db_free_bookmarks(marks, mark_count);
+    }
 
     if (prefix[0] == '\0') {
         Db_Entry *entries = NULL;
@@ -482,8 +666,7 @@ bool resolver_complete(const char *prefix, const Jrun_Config *config, size_t lim
             db_free_entries(entries, count);
         }
     } else {
-        size_t prefix_len = strlen(prefix);
-        Resolve_Result res = resolver_resolve(prefix, config, false);
+        Resolve_Result res = resolve_impl(prefix, config, false, false);
         for (size_t i = 0; i < res.count && ok; ++i) {
             char name[PATH_MAX];
             path_basename_r(res.candidates[i].path, name, sizeof(name));

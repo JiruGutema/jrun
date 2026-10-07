@@ -50,4 +50,25 @@ bool db_cache_invalidate(void);
 // Number of paths currently cached, for `jrun doctor`.
 bool db_cache_stats(size_t *count, int64_t *built_at);
 
+// --- Bookmarks ---------------------------------------------------------------
+//
+// A bookmark pins a name to one directory. It is checked before any matching,
+// so `jrun <name>` always lands there whatever the frecency says.
+
+typedef struct {
+    char *name;
+    char *path;
+} Db_Bookmark;
+
+// Creates or repoints a bookmark. `path` is normalized and must be an
+// existing directory.
+bool db_bookmark_set(const char *name, const char *path);
+// *removed reports whether a bookmark by that name existed.
+bool db_bookmark_remove(const char *name, bool *removed);
+// *out_path is NULL when there is no such bookmark; otherwise caller frees.
+bool db_bookmark_get(const char *name, char **out_path);
+// All bookmarks, sorted by name. Release with db_free_bookmarks().
+bool db_bookmark_list(Db_Bookmark **out, size_t *count);
+void db_free_bookmarks(Db_Bookmark *bookmarks, size_t count);
+
 #endif // JRUN_DATABASE_H_

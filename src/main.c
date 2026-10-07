@@ -6,6 +6,7 @@
 #include "tui.h"
 #include "executor.h"
 #include "shell.h"
+#include "session.h"
 #include "path_util.h"
 
 #include <stdio.h>
@@ -97,6 +98,128 @@ static void run_doctor(const Jrun_Config *config, const char *config_path, const
     printf("\nAll diagnostic checks completed.\n");
 }
 
+// Bookmark names must read as a target and nothing else: no path
+// separators, nothing an option or a path or "@" could start with, and no
+// subcommand names, which would never reach the bookmark.
+static bool bookmark_name_ok(const char *name)
+{
+    if (!name || name[0] == '\0') {
+        jrun_log_error("missing bookmark name");
+        return false;
+    }
+    if (strchr("-@.~", name[0]) || strpbrk(name, "/ \t\n")) {
+        jrun_log_error("invalid bookmark name '%s': it cannot contain '/' or spaces, "
+                       "or start with '-', '@', '.' or '~'", name);
+        return false;
+    }
+    if (cli_is_reserved_word(name)) {
+        jrun_log_error("'%s' is a jrun subcommand and cannot be a bookmark name", name);
+        return false;
+    }
+    return true;
+}
+
+static void print_bookmarks(void)
+{
+    Db_Bookmark *marks = NULL;
+    size_t count = 0;
+    if (!db_bookmark_list(&marks, &count)) return;
+    if (count == 0) {
+        jrun_log_info("no bookmarks yet; add one with `jrun mark <name> [path]`");
+        return;
+    }
+    int width = 4;
+    for (size_t i = 0; i < count; ++i) {
+        int len = (int)strlen(marks[i].name);
+        if (len > width) width = len;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        char short_path[PATH_MAX];
+        path_shorten_tilde(marks[i].path, short_path, sizeof(short_path));
+        printf("%-*s  %s%s\n", width, marks[i].name, short_path,
+               path_is_dir(marks[i].path) ? "" : "  (missing)");
+    }
+    db_free_bookmarks(marks, count);
+}
+
+// Runs the command in several directories one after another, for -a and -m.
+// A failure does not stop the rest, but Ctrl-C does.
+static int run_in_many(const Cli_Args *args, const Jrun_Config *config, const Resolve_Result *res)
+{
+    const char **dirs = (const char **)malloc(res->count * sizeof(*dirs));
+    if (!dirs) return 1;
+    size_t n = 0;
+
+    if (args->multi) {
+        if (!tui_available()) {
+            jrun_log_error("-m needs a terminal for the selector");
+            free(dirs);
+            return 1;
+        }
+        size_t *picked = NULL;
+        size_t picked_count = 0;
+        if (!tui_select_many(res->candidates, res->count, args->target, &picked, &picked_count)) {
+            free(dirs);
+            return 130;  // cancelled
+        }
+        for (size_t i = 0; i < picked_count; ++i) {
+            dirs[n++] = res->candidates[picked[i]].path;
+        }
+        free(picked);
+    } else {
+        // Loose matches would sweep in unrelated directories, so -a only
+        // takes the ones carrying exactly the name asked for.
+        for (size_t i = 0; i < res->count; ++i) {
+            if (res->candidates[i].is_exact_basename) dirs[n++] = res->candidates[i].path;
+        }
+        if (n == 0) {
+            jrun_log_error("no directory is named exactly '%s'; use -m to pick from the matches",
+                           args->target);
+            free(dirs);
+            return 1;
+        }
+    }
+
+    if (!args->yes && config_needs_confirm(config, args->cmd_argv[0])) {
+        char label[64];
+        snprintf(label, sizeof(label), "%zu directories", n);
+        if (!tui_confirm_command(n == 1 ? dirs[0] : label, args->cmd_argv)) {
+            jrun_log_info("cancelled");
+            free(dirs);
+            return 130;
+        }
+    }
+
+    // Same rule as a single run: keep stdout for the commands when piped.
+    FILE *banner = isatty(STDOUT_FILENO) ? stdout : stderr;
+    bool color = isatty(fileno(banner));
+    size_t failures = 0;
+    int ret = 0;
+    for (size_t i = 0; i < n; ++i) {
+        db_add_or_update(dirs[i]);
+        if (!args->quiet) {
+            char short_path[PATH_MAX];
+            path_shorten_tilde(dirs[i], short_path, sizeof(short_path));
+            fprintf(banner, color ? "%s\x1b[1;36m==> %s\x1b[0m\n" : "%s==> %s\n",
+                    i > 0 ? "\n" : "", short_path);
+            fflush(banner);
+        }
+        int rc = executor_run(dirs[i], args->cmd_argv);
+        if (rc != 0) {
+            failures++;
+            ret = rc;
+        }
+        if (rc == 130) break;  // interrupted: stop here rather than carry on
+    }
+    db_age_if_needed();
+
+    if (failures > 0 && n > 1) {
+        jrun_log_error("failed in %zu of %zu directories", failures, n);
+    }
+    free(dirs);
+    return ret;
+}
+
 int main(int argc, char **argv)
 {
     Cli_Args args = {0};
@@ -121,6 +244,20 @@ int main(int argc, char **argv)
         cli_print_version();
         cli_free_args(&args);
         return 0;
+    }
+
+    const char *bad_combo = NULL;
+    if (args.session && args.action == CLI_ACTION_EXECUTE) {
+        bad_combo = "-s opens a session in the directory and does not take a command";
+    } else if ((args.all || args.multi) && args.action == CLI_ACTION_CD) {
+        bad_combo = "-a and -m need a command to run";
+    } else if (args.all && args.multi) {
+        bad_combo = "use either -a or -m, not both";
+    }
+    if (bad_combo) {
+        jrun_log_error("%s", bad_combo);
+        cli_free_args(&args);
+        return 1;
     }
 
     if (args.action == CLI_ACTION_INIT_SHELL) {
@@ -285,6 +422,62 @@ int main(int argc, char **argv)
         break;
     }
 
+    case CLI_ACTION_MARK_LIST:
+        print_bookmarks();
+        break;
+
+    case CLI_ACTION_MARK_ADD: {
+        if (!bookmark_name_ok(args.target)) {
+            ret_code = 1;
+            break;
+        }
+        char mark_path[PATH_MAX];
+        if (args.extra_arg && args.extra_arg[0] != '\0') {
+            snprintf(mark_path, sizeof(mark_path), "%s", args.extra_arg);
+        } else if (!getcwd(mark_path, sizeof(mark_path))) {
+            jrun_log_error("failed to get current working directory");
+            ret_code = 1;
+            break;
+        }
+        if (!db_bookmark_set(args.target, mark_path)) {
+            ret_code = 1;
+            break;
+        }
+        char *stored = NULL;
+        db_bookmark_get(args.target, &stored);
+        char short_path[PATH_MAX];
+        path_shorten_tilde(stored ? stored : mark_path, short_path, sizeof(short_path));
+        jrun_log_info("%s -> %s", args.target, short_path);
+        free(stored);
+        break;
+    }
+
+    case CLI_ACTION_MARK_REMOVE: {
+        if (!args.target) {
+            jrun_log_error("missing bookmark name to remove");
+            ret_code = 1;
+            break;
+        }
+        bool removed = false;
+        if (!db_bookmark_remove(args.target, &removed)) {
+            ret_code = 1;
+        } else if (!removed) {
+            jrun_log_error("no bookmark named '%s'", args.target);
+            ret_code = 1;
+        }
+        break;
+    }
+
+    case CLI_ACTION_COMPLETE_MARK: {
+        Db_Bookmark *marks = NULL;
+        size_t count = 0;
+        if (db_bookmark_list(&marks, &count)) {
+            for (size_t i = 0; i < count; ++i) printf("%s\n", marks[i].name);
+            db_free_bookmarks(marks, count);
+        }
+        break;
+    }
+
     case CLI_ACTION_REINDEX: {
         size_t indexed = 0;
         if (resolver_reindex(&config, &indexed)) {
@@ -326,12 +519,14 @@ int main(int argc, char **argv)
         for (size_t i = 0; i < res.count; ++i) {
             char short_path[PATH_MAX];
             path_shorten_tilde(res.candidates[i].path, short_path, sizeof(short_path));
+            const char *source = res.candidates[i].is_bookmark ? "(mark)"
+                               : res.candidates[i].from_db ? "(db)" : "(root)";
             printf("%-10.2f  %-8.1f  %-10.2f  %s %s\n",
                    res.candidates[i].score,
                    res.candidates[i].match_quality,
                    res.candidates[i].frecency,
                    short_path,
-                   res.candidates[i].from_db ? "(db)" : "(root)");
+                   source);
         }
         resolver_free_result(&res);
         break;
@@ -378,6 +573,16 @@ int main(int argc, char **argv)
         }
 
         Resolve_Result res = resolver_resolve(args.target, &config, false);
+        if (res.status == RESOLVE_NO_MATCH && resolver_is_project_target(args.target)) {
+            if (args.target[1] == '\0') {
+                jrun_log_error("not inside a project (no .git or project file above here)");
+            } else {
+                jrun_log_error("no directory %s in this project", args.target + 2);
+            }
+            resolver_free_result(&res);
+            ret_code = 1;
+            break;
+        }
         if (res.status == RESOLVE_NO_MATCH) {
             fprintf(stderr, "jrun: no directory found for: %s\n\nSearched:\n", args.target);
             for (size_t i = 0; i < config.roots_count; ++i) {
@@ -385,6 +590,12 @@ int main(int argc, char **argv)
             }
             resolver_free_result(&res);
             ret_code = 1;
+            break;
+        }
+
+        if (args.all || args.multi) {
+            ret_code = run_in_many(&args, &config, &res);
+            resolver_free_result(&res);
             break;
         }
 
@@ -415,7 +626,14 @@ int main(int argc, char **argv)
             }
         }
 
-        if (args.action == CLI_ACTION_CD) {
+        if (args.action == CLI_ACTION_CD && args.session) {
+            db_add_or_update(selected_path);
+            db_age_if_needed();
+            // Outside tmux this execs tmux in jrun's place, so let go of the
+            // database first.
+            db_close();
+            ret_code = session_open(selected_path);
+        } else if (args.action == CLI_ACTION_CD) {
             db_add_or_update(selected_path);
             db_age_if_needed();
             printf("%s\n", selected_path);
