@@ -957,10 +957,10 @@ static ssize_t run_selector(const Resolve_Candidate *candidates, size_t count,
 
             const char *footer;
             if (marks) {
-                footer = (width >= 62) ? "⇥ mark · ↑↓ move · ⏎ run · ^U clear · esc cancel"
+                footer = (width >= 62) ? "⇥ mark ·^j/k | ↑↓ move · ⏎ run · ^U clear · esc cancel"
                        : (width >= 30) ? "⇥ mark · ⏎ run · esc" : "⇥ · ⏎ · esc";
             } else {
-                footer = (width >= 62) ? "↑↓ move · ⏎ open · ^W word · ^U clear · esc cancel"
+                footer = (width >= 62) ? "^j/k | ↑↓ move · ⏎ open · ^W word · ^U clear · esc cancel"
                        : (width >= 30) ? "↑↓ · ⏎ open · esc" : "⏎ · esc";
             }
             buf_puts(&buf, "│ " SGR_DIM);
