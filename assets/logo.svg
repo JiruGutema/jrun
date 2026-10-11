@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1c2230"/>
+      <stop offset="1" stop-color="#0b0e14"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#9af5a8"/>
+      <stop offset="1" stop-color="#3fd17a"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <rect x="6" y="6" width="500" height="500" rx="106" fill="none" stroke="#ffffff" stroke-opacity="0.06" stroke-width="4"/>
+  <g transform="translate(26 -38)">
+    <!-- prompt chevron -->
+    <polyline points="118,208 196,270 118,332" fill="none" stroke="url(#accent)" stroke-width="46" stroke-linecap="round" stroke-linejoin="round"/>
+    <!-- jump arc -->
+    <path d="M206 196 Q236 118 290 140" fill="none" stroke="#9af5a8" stroke-opacity="0.55" stroke-width="10" stroke-linecap="round" stroke-dasharray="1 22"/>
+    <!-- cursor block as the j's tittle -->
+    <rect x="304" y="120" width="56" height="66" rx="10" fill="url(#accent)"/>
+    <!-- j -->
+    <path d="M332 232 V348 A78 78 0 0 1 254 426 H236" fill="none" stroke="#eef1f6" stroke-width="56" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+</svg>

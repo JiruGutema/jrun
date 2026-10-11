@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/logo.png" width="128" alt="jrun logo"></p>
+
 # jrun
 
 Fast, project-aware directory jumper and arbitrary command launcher for Linux. Written in **C11**.
